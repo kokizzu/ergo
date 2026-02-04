@@ -135,7 +135,14 @@ func (c *connection) Spawn(name gen.Atom, options gen.ProcessOptions, args ...an
 	if c.core.Security().ExposeEnvRemoteSpawn {
 		opts.ParentEnv = c.core.EnvList()
 	}
-	return c.RemoteSpawn(name, opts)
+	pid, err := c.RemoteSpawn(name, opts)
+	if err != nil {
+		return pid, err
+	}
+	if options.LinkChild {
+		c.core.RouteLinkPID(c.core.PID(), pid)
+	}
+	return pid, nil
 }
 
 func (c *connection) SpawnRegister(
@@ -155,7 +162,14 @@ func (c *connection) SpawnRegister(
 	if c.core.Security().ExposeEnvRemoteSpawn {
 		opts.ParentEnv = c.core.EnvList()
 	}
-	return c.RemoteSpawn(name, opts)
+	pid, err := c.RemoteSpawn(name, opts)
+	if err != nil {
+		return pid, err
+	}
+	if options.LinkChild {
+		c.core.RouteLinkPID(c.core.PID(), pid)
+	}
+	return pid, nil
 }
 
 func (c *connection) ApplicationStart(name gen.Atom, options gen.ApplicationOptions) error {
@@ -200,6 +214,40 @@ func (c *connection) applicationStart(name gen.Atom, mode gen.ApplicationMode, o
 	}
 	result := c.waitResult(ref, ch)
 	return result.Error
+}
+
+func (c *connection) ApplicationInfo(name gen.Atom) (gen.ApplicationInfo, error) {
+	var info gen.ApplicationInfo
+
+	ref := c.core.MakeRef()
+	message := MessageApplicationInfo{
+		Name: name,
+		Ref:  ref,
+	}
+
+	ch := make(chan MessageResult)
+	c.requestsMutex.Lock()
+	c.requests[ref] = ch
+	c.requestsMutex.Unlock()
+
+	if err := c.sendAny(message, 0, 0, gen.Compression{}); err != nil {
+		c.requestsMutex.Lock()
+		delete(c.requests, ref)
+		c.requestsMutex.Unlock()
+		return info, err
+	}
+
+	result := c.waitResult(ref, ch)
+	if result.Error != nil {
+		return info, result.Error
+	}
+
+	info, ok := result.Result.(gen.ApplicationInfo)
+	if ok == false {
+		return info, gen.ErrMalformed
+	}
+
+	return info, nil
 }
 
 func (c *connection) Creation() int64 {
@@ -284,6 +332,10 @@ func (c *connection) SendPID(from gen.PID, to gen.PID, options gen.MessageOption
 
 	if err := edf.Encode(message, buf, c.encodeOptions); err != nil {
 		return err
+	}
+
+	if c.peer_maxmessagesize > 0 && buf.Len() > c.peer_maxmessagesize {
+		return gen.ErrTooLarge
 	}
 
 	if buf.Len() > math.MaxUint32 {
@@ -569,7 +621,17 @@ func (c *connection) SendResponse(from gen.PID, to gen.PID, options gen.MessageO
 	buf.B[6] = orderPeer
 	buf.B[7] = protoMessageResponse
 	binary.BigEndian.PutUint64(buf.B[8:16], from.ID)
+
 	buf.B[16] = byte(options.Priority) // usual value 0, 1, or 2, so just cast it
+	if options.ImportantDelivery {
+		if c.peer_flags.EnableImportantDelivery == false {
+			lib.ReleaseBuffer(buf)
+			return gen.ErrUnsupported
+		}
+		// set important flag
+		buf.B[16] |= 128
+	}
+
 	binary.BigEndian.PutUint64(buf.B[17:25], to.ID)
 	binary.BigEndian.PutUint64(buf.B[25:33], options.Ref.ID[0])
 	binary.BigEndian.PutUint64(buf.B[33:41], options.Ref.ID[1])
@@ -615,7 +677,17 @@ func (c *connection) SendResponseError(from gen.PID, to gen.PID, options gen.Mes
 	buf.B[6] = orderPeer
 	buf.B[7] = protoMessageResponseError
 	binary.BigEndian.PutUint64(buf.B[8:16], from.ID)
+
 	buf.B[16] = byte(options.Priority) // usual value 0, 1, or 2, so just cast it
+	if options.ImportantDelivery {
+		if c.peer_flags.EnableImportantDelivery == false {
+			lib.ReleaseBuffer(buf)
+			return gen.ErrUnsupported
+		}
+		// set important flag
+		buf.B[16] |= 128
+	}
+
 	binary.BigEndian.PutUint64(buf.B[17:25], to.ID)
 	binary.BigEndian.PutUint64(buf.B[25:33], options.Ref.ID[0])
 	binary.BigEndian.PutUint64(buf.B[33:41], options.Ref.ID[1])
@@ -1349,8 +1421,24 @@ func (c *connection) RemoteSpawn(name gen.Atom, options gen.ProcessOptionsExtra)
 		return pid, gen.ErrNotAllowed
 	}
 
+	// calculate deadline on sender side
+	timeout := options.InitTimeout
+	if timeout == 0 {
+		timeout = gen.DefaultRequestTimeout
+	}
+	if timeout > gen.DefaultRequestTimeout*3 {
+		return pid, gen.ErrNotAllowed
+	}
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := c.core.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return pid, err
+	}
+
+	// set ref for spawn timeout
+	options.Ref = ref
+
 	order := uint8(pid.ID % 255)
-	ref := c.core.MakeRef()
 
 	message := MessageSpawn{
 		Name:    name,
@@ -2125,7 +2213,8 @@ func (c *connection) handleRecvQueue(q lib.QueueMPSC) {
 				Creation: c.core.Creation(),
 			}
 			idFrom := binary.BigEndian.Uint64(buf.B[8:16])
-			priority := gen.MessagePriority(buf.B[16])
+			priority := gen.MessagePriority(buf.B[16] & 3)
+			important := (buf.B[16] & 128) > 0
 			idTO := binary.BigEndian.Uint64(buf.B[17:25])
 			ref.ID[0] = binary.BigEndian.Uint64(buf.B[25:33])
 			ref.ID[1] = binary.BigEndian.Uint64(buf.B[33:41])
@@ -2157,10 +2246,20 @@ func (c *connection) handleRecvQueue(q lib.QueueMPSC) {
 			}
 
 			opts := gen.MessageOptions{
-				Ref:      ref,
-				Priority: priority,
+				Ref:               ref,
+				Priority:          priority,
+				ImportantDelivery: important,
 			}
-			c.core.RouteSendResponse(from, to, opts, msg)
+
+			err = c.core.RouteSendResponse(from, to, opts, msg)
+
+			if important == false {
+				continue
+			}
+			if err != nil {
+				opts.ImportantDelivery = false
+				c.SendResponseError(to, from, opts, err)
+			}
 
 		case protoMessageResponseError:
 			if buf.Len() < 50 {
@@ -2173,7 +2272,8 @@ func (c *connection) handleRecvQueue(q lib.QueueMPSC) {
 				Creation: c.core.Creation(),
 			}
 			idFrom := binary.BigEndian.Uint64(buf.B[8:16])
-			priority := gen.MessagePriority(buf.B[16])
+			priority := gen.MessagePriority(buf.B[16] & 3)
+			important := (buf.B[16] & 128) > 0
 			idTO := binary.BigEndian.Uint64(buf.B[17:25])
 			ref.ID[0] = binary.BigEndian.Uint64(buf.B[25:33])
 			ref.ID[1] = binary.BigEndian.Uint64(buf.B[33:41])
@@ -2190,8 +2290,9 @@ func (c *connection) handleRecvQueue(q lib.QueueMPSC) {
 				Creation: c.core.Creation(),
 			}
 			opts := gen.MessageOptions{
-				Ref:      ref,
-				Priority: priority,
+				Ref:               ref,
+				Priority:          priority,
+				ImportantDelivery: important,
 			}
 
 			var r error // result
@@ -2231,7 +2332,15 @@ func (c *connection) handleRecvQueue(q lib.QueueMPSC) {
 				c.log.Error("received incorrect response error id")
 				continue
 			}
-			c.core.RouteSendResponseError(from, to, opts, r)
+			err := c.core.RouteSendResponseError(from, to, opts, r)
+			if important == false {
+				continue
+			}
+			if err != nil {
+				opts.ImportantDelivery = false
+				c.SendResponseError(to, from, opts, err)
+			}
+			continue
 
 		case protoMessageTerminatePID:
 			if buf.Len() < 18 {
@@ -2464,7 +2573,7 @@ func (c *connection) handleRecvQueue(q lib.QueueMPSC) {
 			skipBytes := 9 // proto header for compressed message
 			switch buf.B[8] {
 			case gen.CompressionTypeGZIP.ID():
-				dbuf, err := lib.DecompressGZIP(buf, uint(skipBytes))
+				dbuf, err := lib.DecompressGZIP(buf, uint(skipBytes), c.node_maxmessagesize)
 				if err != nil {
 					c.log.Error("unable to decompress message (gzip), ignored: %s", err)
 					continue
@@ -2474,9 +2583,9 @@ func (c *connection) handleRecvQueue(q lib.QueueMPSC) {
 				goto re
 
 			case gen.CompressionTypeLZW.ID():
-				dbuf, err := lib.DecompressLZW(buf, uint(skipBytes))
+				dbuf, err := lib.DecompressLZW(buf, uint(skipBytes), c.node_maxmessagesize)
 				if err != nil {
-					c.log.Error("unable to decompress message (lzw), ignored")
+					c.log.Error("unable to decompress message (lzw), ignored: %s", err)
 					continue
 				}
 				lib.ReleaseBuffer(buf)
@@ -2484,9 +2593,9 @@ func (c *connection) handleRecvQueue(q lib.QueueMPSC) {
 				goto re
 
 			case gen.CompressionTypeZLIB.ID():
-				dbuf, err := lib.DecompressZLIB(buf, uint(skipBytes))
+				dbuf, err := lib.DecompressZLIB(buf, uint(skipBytes), c.node_maxmessagesize)
 				if err != nil {
-					c.log.Error("unable to decompress message (zlib), ignored")
+					c.log.Error("unable to decompress message (zlib), ignored: %s", err)
 					continue
 				}
 				lib.ReleaseBuffer(buf)
@@ -2812,6 +2921,18 @@ func (c *connection) routeMessage(msg any) {
 		result := MessageResult{
 			Error: err,
 			Ref:   m.Ref,
+		}
+		order := uint8(0)
+		orderPeer := uint8(0)
+		c.sendAny(result, order, orderPeer, gen.Compression{})
+
+	case MessageApplicationInfo:
+		info, err := c.core.RouteApplicationInfo(m.Name)
+
+		result := MessageResult{
+			Error:  err,
+			Result: info,
+			Ref:    m.Ref,
 		}
 		order := uint8(0)
 		orderPeer := uint8(0)

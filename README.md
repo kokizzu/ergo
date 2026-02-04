@@ -4,28 +4,27 @@
 [![GoDoc](https://pkg.go.dev/badge/ergo-services/ergo)](https://pkg.go.dev/ergo.services/ergo)
 [![MIT license](https://img.shields.io/badge/license-MIT-brightgreen.svg)](https://opensource.org/licenses/MIT)
 [![Telegram Community](https://img.shields.io/badge/Telegram-ergo__services-229ed9?style=flat&logo=telegram&logoColor=white)](https://t.me/ergo_services)
-[![Twitter](https://img.shields.io/badge/twitter-ergo__services-00acee?style=flat&logo=x&logoColor=white)](https://x.com/ergo_services)
 [![Reddit](https://img.shields.io/badge/Reddit-r/ergo__services-ff4500?style=plastic&logo=reddit&logoColor=white&style=flat)](https://reddit.com/r/ergo_services)
 
 The Ergo Framework is an implementation of ideas, technologies, and design patterns from the Erlang world in the Go programming language. It is based on the actor model, network transparency, and a set of ready-to-use components for development. This significantly simplifies the creation of complex and distributed solutions while maintaining a high level of reliability and performance.
 
 ### Features ###
 
-1. **Actor Model**: enables the creation of scalable and fault-tolerant systems using isolated actors that interact through message passing. Actors can exchange asynchronous messages as well as perform synchronous requests, offering flexibility in communication patterns.
+1. **Actor Model**: isolated processes communicate through message passing, handling messages sequentially in their own mailbox with four priority queues. Processes support both asynchronous messaging and synchronous request-response patterns, enabling flexible communication while maintaining the actor model guarantees.
 
-2. **Network Transparency**: actors can interact regardless of their physical location, supported by a [high-performance](https://github.com/ergo-services/benchmarks) implementation of the [network stack](https://docs.ergo.services/networking/network-stack), which simplifies the creation of distributed systems.
+2. **Network Transparency**: actors interact the same way whether local or remote. The framework uses custom serialization and protocol for [efficient](https://github.com/ergo-services/benchmarks) distributed communication with connection pooling, compression, and type caching, making network location transparent to application code.
 
-3. **Observability**: framework includes built-in observability features, including [service discovery](https://docs.ergo.services/networking/service-discovering) and [static routes](https://docs.ergo.services/networking/static-routes), allowing nodes to automatically register themselves and find routes to remote nodes. This mechanism simplifies managing distributed systems by enabling seamless communication and interaction between nodes across the network.
+3. **Supervision Trees**: hierarchical fault recovery where supervisors monitor child processes and apply restart strategies when failures occur. Supports multiple supervision types (One For One, All For One, Rest For One, Simple One For One) and restart strategies (Transient, Temporary, Permanent) for building self-healing systems.
 
-4. **Ready-to-use Components**: A set of [ready-to-use actors](https://docs.ergo.services/actors) simplifying development, including state management and error handling.
+4. **Meta Processes**: bridge blocking I/O with the actor model through dedicated meta processes that handle TCP, UDP, Port, and Web protocols. Meta processes run blocking operations without affecting regular actor message processing.
 
-5. **Support for Distributed Systems**: framework includes built-in mechanisms for creating and managing clustered systems, [distributed events](https://docs.ergo.services/basics/events) (publish/subscribe mechanism), [remote actor spawning](https://docs.ergo.services/networking/remote-spawn-process), and [remote application startup](https://docs.ergo.services/networking/remote-start-application). These features enable easy scaling, efficient message broadcasting across your cluster, and the ability to manage distributed components seamlessly.
+5. **Distributed Systems**: service discovery through embedded or external registrars (etcd, Saturn), distributed publish/subscribe events with token-based authorization and buffering, remote process spawning with factory-based permissions, and remote application orchestration across nodes.
 
-6. **Reliability and Fault Tolerance**: the framework is designed to minimize failures and ensure automatic recovery, featuring a [supervisor tree](https://docs.ergo.services/basics/supervision-tree) structure to manage and [restart failed actors](https://docs.ergo.services/actors/supervisor#restart-strategy), which is crucial for mission-critical applications.
-   
-7. **Flexibility**: This framework offers convenient interfaces for customizing [network stack components](https://docs.ergo.services/networking/network-stack#network-stack-interfaces), creating and integrating custom [loggers](https://docs.ergo.services/basics/logging), [managing SSL certificates](https://docs.ergo.services/basics/certmanager), and more.
+6. **Ready-to-use Components**: core framework includes Actor, Supervisor, Pool, and WebWorker actors plus TCP, UDP, Port, and Web meta processes. Extra library provides Leader, Metrics actors, WebSocket, SSE meta processes, Observer application, Colored and Rotate loggers, Erlang protocol support.
 
-In the https://github.com/ergo-services/examples repository, you will find examples that demonstrate a range of the framework's capabilities.
+7. **Flexibility**: customize network stack components, certificate management, compression and message priorities, logging, distributed events, and meta processes. Framework supports mTLS, NAT traversal, important delivery for guaranteed messaging, and Cron-based scheduling.
+
+Examples demonstrating the framework's capabilities are available in the [examples repository](https://github.com/ergo-services/examples).
 
 ### Benchmarks ###
 
@@ -33,13 +32,15 @@ On a 64-core processor, Ergo Framework demonstrates a performance of **over 21 m
 
 ![image](https://github.com/user-attachments/assets/813900ad-ff79-4cc7-b1e6-396c5781acb1)
 
-You can find available benchmarks in the following repository https://github.com/ergo-services/benchmarks.
+Available benchmarks can be found in the [benchmarks repository](https://github.com/ergo-services/benchmarks).
 
 * Messaging performance (local, network)
 
-* Memory consumption per process (demonstrates framework memory footprint).
+* Memory consumption per process (demonstrates framework memory footprint)
 
 * Serialization performance comparison: EDF vs Protobuf vs Gob
+
+* Distributed Pub/Sub (event delivery to 1,000,000 subscribers across 10 nodes)
 
 ### Observer ###
 To inspect the node, network stack, running applications, and processes, you can use the [`observer`](https://github.com/ergo-services/tools/) tool
@@ -52,7 +53,7 @@ To install the Observer tool, you need to have the Go compiler version 1.20 or h
 $ go install ergo.tools/observer@latest
 ```
 
-You can also embed the [Observer application](https://docs.ergo.services/extra-library/applications/observer) into your node. To see it in action, see example `demo` at https://github.com/ergo-services/examples. For more information https://docs.ergo.services/tools/observer 
+You can also embed the [Observer application](https://docs.ergo.services/extra-library/applications/observer) into your node. To see it in action, see the [demo example](https://github.com/ergo-services/examples/tree/master/demo). For more information, visit the [Observer documentation](https://docs.ergo.services/tools/observer). 
 
 
 
@@ -123,7 +124,7 @@ Since we included Observer application, open http://localhost:9911 to inspect yo
 
 ### Erlang support ###
 
-Starting from version 3.0.0, support for the Erlang network stack has been moved to a separate module - https://github.com/ergo-services/proto. Version 3.0 was distributed under the BSL 1.1 license, but starting from version 3.1 it is available under the MIT license. You can find detailed information on using this module in the documentation at https://docs.ergo.services/extra-library/network-protocols/erlang.
+Starting from version 3.0.0, support for the Erlang network stack has been moved to a [separate module](https://github.com/ergo-services/proto). Version 3.0 was distributed under the BSL 1.1 license, but starting from version 3.1 it is available under the MIT license. Detailed information is available in the [Erlang protocol documentation](https://docs.ergo.services/extra-library/network-protocols/erlang).
 
 ### Requirements ###
 
@@ -133,44 +134,95 @@ Starting from version 3.0.0, support for the Erlang network stack has been moved
 
 Fully detailed changelog see in the [ChangeLog](CHANGELOG.md) file.
 
-#### [v3.1.0](https://github.com/ergo-services/ergo/releases/tag/v1.999.310) 2025-09-04 [tag version v1.999.310] ####
+#### [v3.2.0](https://github.com/ergo-services/ergo/releases/tag/v1.999.320) 2026-02-04 [tag version v1.999.320] ####
 
-**New Features**
-- **Cron Scheduler**: New `gen.Cron` interface enables scheduling tasks with cron expressions, supporting second-level precision for precise task execution. See https://docs.ergo.services/basics/cron
-- **Port Meta Process**: New `meta.Port` allows spawning and managing external OS processes with bidirectional communication through stdin/stdout/stderr. See https://docs.ergo.services/meta-processes/port, example https://github.com/ergo-services/examples/port
-- **Unit Testing Framework**: Comprehensive testing library (`testing/unit`) provides isolated actor testing with event capture and validation capabilities. See https://docs.ergo.services/testing/unit
+* Introduced **mTLS support** - new `gen.CertAuthManager` interface for mutual TLS with CA pool management (`ClientCAs`, `RootCAs`, `ClientAuth`, `ServerName`). See [Mutual TLS](https://docs.ergo.services/networking/mutual-tls) documentation
+* Introduced **NAT support** - new `RouteHost` and `RoutePort` options in `gen.AcceptorOptions` for nodes behind NAT or load balancers. See [Behind the NAT](https://docs.ergo.services/networking/behind-the-nat) documentation
+* Introduced **spawn time control** - `InitTimeout` option in `gen.ProcessOptions` limits `ProcessInit` duration for both local and remote spawn. Remote spawn and application processes limited to max 15 seconds. See [Process](https://docs.ergo.services/basics/process) documentation
+* Introduced **zip-bomb protection** - decompression size limits to prevent memory exhaustion attacks
+* Added `gen.Ref` methods for request timeout tracking. See [Generic Types](https://docs.ergo.services/basics/generic-types#gen.ref):
+  - `Deadline` - returns deadline timestamp stored in reference
+  - `IsAlive` - checks if reference is still valid (deadline not exceeded)
+* Added `gen.Node` methods. See [Node](https://docs.ergo.services/basics/node) documentation:
+  - `ProcessPID` / `ProcessName` - resolve process PID by name and vice versa
+  - `Call`, `CallWithTimeout`, `CallWithPriority`, `CallImportant`, `CallPID`, `CallProcessID`, `CallAlias` - synchronous requests from Node interface
+  - `Inspect` / `InspectMeta` - inspect processes and meta processes
+  - `MakeRefWithDeadline` - create reference with embedded deadline
+* Added `gen.RemoteNode.ApplicationInfo` - query application information from remote nodes. See [Remote Start Application](https://docs.ergo.services/networking/remote-start-application) documentation
+* Added `gen.Process` methods. See [Process](https://docs.ergo.services/basics/process) documentation:
+  - `SendWithPriorityAfter` - delayed send with priority
+  - `SendExitAfter` / `SendExitMetaAfter` - delayed exit signals
+  - `SendResponseImportant` / `SendResponseErrorImportant` - important delivery for responses
+* Added `gen.Meta` methods. See [Meta Process](https://docs.ergo.services/basics/meta-process) documentation:
+  - `SendResponse` / `SendResponseError` - respond to requests from meta process
+  - `SendPriority` / `SetSendPriority` - message priority control
+  - `Compression` / `SetCompression` - compression settings
+  - `EnvDefault` - get environment variable with default value
+* Added `gen.ApplicationSpec` / `gen.ApplicationInfo` fields:
+  - `Tags` - labels for instance selection (blue/green, canary, maintenance). See [Tags for Instance Selection](https://docs.ergo.services/basics/application#tags-for-instance-selection)
+  - `Map` - logical role to process name mapping. See [Process Role Mapping](https://docs.ergo.services/basics/application#process-role-mapping)
+* Added **HandleInspect** implementations for all supervisor types (OFO, ARFO, SOFO)
+* Fixed **LinkChild** in `RemoteNode.Spawn` / `RemoteNode.SpawnRegister`
+* Fixed **args persistence** for Simple One For One supervisor - child processes now restart with their original spawn arguments
+* Fixed **critical bug**: terminate signals (Link/Monitor exits) were incorrectly rejected due to wrong incarnation validation in network layer. Thanks to [@qjpcpu](https://github.com/qjpcpu) for reporting [#248](https://github.com/ergo-services/ergo/issues/248)
+* Completely reworked internal **Target Manager** (`node/tm/`) - improved architecture for process, event, and node target management with comprehensive test coverage
+* Completely reworked internal **Pub/Sub** mechanism - improved reliability and performance
+* Improved **ProcessInit state** - more `gen.Process` methods now available during initialization:
+  - `Link*`, `Unlink*`, `Monitor*`, `Demonitor*`
+  - `Call*`, `Inspect`, `InspectMeta`
+  - `RegisterName`, `UnregisterName`, `RegisterEvent`, `UnregisterEvent`
+  - `SendResponse*`, `SendResponseError*`
+  - `CreateAlias`, `DeleteAlias`
+* Introduced **shutdown timeout** - `ShutdownTimeout` option in `gen.NodeOptions` (default 3 minutes). During graceful shutdown, pending processes are logged every 5 seconds with state and queue info. After timeout, node force exits with error code 1. See [Node](https://docs.ergo.services/basics/node) documentation
+* Added **pprof labels** for actor and meta process goroutines (with `--tags pprof`) - each process goroutine is labeled with its PID, each meta process with its Alias, making it easy to identify stuck processes in pprof output
+* Improved API documentation - comprehensive godoc comments for all public interfaces
+* **Documentation rewritten** - complete documentation now included in the repository (`docs/`) and available at [docs.ergo.services](https://docs.ergo.services)
+* New documentation articles:
+  - [Project Structure](https://docs.ergo.services/basics/project-structure) - organizing projects with message isolation levels, deployment patterns, and evolution strategies
+  - [Building a Cluster](https://docs.ergo.services/advanced/building-a-cluster) - step-by-step guide to distributed systems with service discovery, load balancing, and failover
+  - [Message Versioning](https://docs.ergo.services/advanced/message-versioning) - evolving message contracts in distributed clusters with explicit versioning strategies
+  - [Handle Sync](https://docs.ergo.services/advanced/handle-sync) - synchronous message handling patterns
+  - [Important Delivery](https://docs.ergo.services/advanced/important-delivery) - guaranteed delivery mechanism
+  - [Pub/Sub Internals](https://docs.ergo.services/advanced/pub-sub-internals) - event system architecture
+  - [Debugging](https://docs.ergo.services/advanced/debugging) - build tags, pprof integration, troubleshooting stuck processes
 
-**Enhancements**
-- **Enhanced Logging**: Default logger now supports JSON output format with structured fields, improving observability and log processing
-- **Environment Management**: Added `gen.Process.EnvDefault()` and `gen.Node.EnvDefault()` methods
-- **Logger Fields**: Added `gen.Log.PushFields()` and `gen.Log.PopFields()` for contextual logging
-- **EDF Protocol**: Added support for `encoding.BinaryMarshaler/BinaryUnmarshaler` interfaces
-- **Performance**: Multiple optimizations across message handling and network operations
+* **Extra Library - Actors** (https://github.com/ergo-services/actor):
+  - Introduced **Leader** actor - distributed leader election with Raft-inspired consensus algorithm. Features: term-based disambiguation, automatic failover, split-brain prevention through majority quorum, dynamic peer discovery. See [documentation](https://docs.ergo.services/extra-library/actors/leader)
+  - Introduced **Metrics** actor - Prometheus metrics exporter that collects node/network telemetry via HTTP endpoint. Features: automatic collection of node metrics (uptime, processes, memory), network metrics per remote node, extensible for custom metrics. See [documentation](https://docs.ergo.services/extra-library/actors/metrics)
 
-**Critical Bug Fixes**
-- **Node Shutdown**: Fixed race condition causing "close of closed channel" panic during graceful shutdown
-- **Supervisor Issues**: Fixed OFO supervisor child termination (#213), restart intensity calculation with millisecond precision, and duplicate Terminate callbacks
-- **SIGTERM Handling**: Improved graceful shutdown behavior and SOFO supervisor cleanup
-- **EDF Codec**: Fixed nil slice/map decoding issues
-- **Local Registrar**: Improved resolver detection for service discovery
+* **Extra Library - Meta Processes** (https://github.com/ergo-services/meta):
+  - Introduced **SSE** (Server-Sent Events) meta-process - unidirectional server-to-client streaming over HTTP. Features: server handler for accepting connections, client connection for external SSE endpoints, full SSE spec support (event types, IDs, retry hints, multi-line data), process pool with round-robin load balancing, Last-Event-ID for reconnection. See [documentation](https://docs.ergo.services/extra-library/meta-processes/sse)
 
-**Extra Library**
-- **Module Independence**: All extra library modules (Logger, Meta, Registrar, etc...) are now independent Go modules with dependency management
-- **Tools Domain**: All tools moved to dedicated `ergo.tools` domain for better organization and distribution
-- **Proto**: `erlang23` (Erlang network stack implementation) changed from BSL 1.1 to MIT license for broader adoption and commercial use
-- **Registrar**: New etcd registrar implementation with distributed service discovery, hierarchical configuration, real-time cluster events. See https://docs.ergo.services/extra-library/registrars/etcd-client and example https://github.com/ergo-services/examples/docker
-- **Logger**: Added LogField support in colored logger, banner functionality, and fixed options handling. See https://docs.ergo.services/extra-library/loggers
-- **Application**: Observer application enhanced with new Applications page, Cron job details, and UI fixes. See https://docs.ergo.services/extra-library/applications/observer
-- **Benchmarks**: New serialization benchmarks comparing EDF vs Gob vs Protobuf performance, expanded test suite coverage. See https://github.com/ergo-services/benchmarks
+* **Benchmarks** (https://github.com/ergo-services/benchmarks):
+  - Introduced **Distributed Pub/Sub** benchmark - demonstrates event delivery to 1,000,000 subscribers across 10 nodes. Achieves 2.9M msg/sec delivery rate with only 10 network messages (one per consumer node) instead of 1M
+
 
 ### Development and debugging ###
 
-To enable Golang profiler just add `--tags debug` in your `go run` or `go build` (profiler runs at
-`http://localhost:9009/debug/pprof`)
+To enable Golang profiler just add `--tags pprof` in your `go run` or `go build` (profiler runs at
+`http://localhost:9009/debug/pprof`). Use `PPROF_HOST` and `PPROF_PORT` environment variables to customize the address.
+
+With `--tags pprof`, each actor goroutine is labeled with its PID and each meta process with its Alias for easy identification in pprof output:
+
+```
+curl -s "http://localhost:9009/debug/pprof/goroutine?debug=1" | grep -B5 'labels:.*pid'
+curl -s "http://localhost:9009/debug/pprof/goroutine?debug=1" | grep -B5 'labels:.*meta'
+```
+
+Output:
+```
+1 @ 0x100c17fa0 ...
+# labels: {"pid":"<ABC123.0.1005>"}
+#   main.(*Worker).HandleMessage+0x27  /path/worker.go:45
+```
+
+This helps identify stuck processes during shutdown by matching PIDs/Aliases from the shutdown log with goroutine stack traces.
 
 To disable panic recovery use `--tags norecover`.
 
 To enable trace logging level for the internals (node, network,...) use `--tags trace` and set the log level `gen.LogLevelTrace` for your node.
+
+For detailed debugging techniques, troubleshooting scenarios, and best practices, see the [Debugging](https://docs.ergo.services/advanced/debugging) documentation.
 
 To run tests with cleaned test cache:
 

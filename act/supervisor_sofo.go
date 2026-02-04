@@ -14,12 +14,14 @@ func createSupSimpleOneForOne() supBehavior {
 	return &supSOFO{
 		spec: make(map[gen.Atom]*supChildSpec),
 		pids: make(map[gen.PID]*supChildSpec),
+		args: make(map[gen.PID][]any),
 	}
 }
 
 type supSOFO struct {
 	spec map[gen.Atom]*supChildSpec
 	pids map[gen.PID]*supChildSpec
+	args map[gen.PID][]any // stores per-instance args for restart
 
 	restart  SupervisorRestart
 	restarts []int64
@@ -105,8 +107,13 @@ func (s *supSOFO) childStarted(spec supChildSpec, pid gen.PID) supAction {
 		return action
 	}
 
-	// do not overwrite args since it is a dynamic child
+	// do not overwrite spec args since it is a dynamic child
 	// sc.Args = spec.Args
+
+	// store per-instance args for restart
+	if len(spec.Args) > 0 {
+		s.args[pid] = spec.Args
+	}
 
 	// keep it and do nothing
 	s.pids[pid] = sc
@@ -116,7 +123,11 @@ func (s *supSOFO) childStarted(spec supChildSpec, pid gen.PID) supAction {
 func (s *supSOFO) childTerminated(name gen.Atom, pid gen.PID, reason error) supAction {
 	var action supAction
 
+	// save args before deleting pid
+	instanceArgs, hasArgs := s.args[pid]
+
 	delete(s.pids, pid)
+	delete(s.args, pid)
 
 	if s.shutdown {
 		delete(s.wait, pid)
@@ -162,6 +173,11 @@ func (s *supSOFO) childTerminated(name gen.Atom, pid gen.PID, reason error) supA
 			// do restart
 			action.do = supActionStartChild
 			action.spec = *spec
+
+			// use per-instance args if available, otherwise use spec args
+			if hasArgs {
+				action.spec.Args = instanceArgs
+			}
 
 			return action
 		}
@@ -218,6 +234,8 @@ func (s *supSOFO) childDisable(name gen.Atom) (supAction, error) {
 		}
 		terminate = append(terminate, pid)
 		s.wait[pid] = true
+		// clean up stored args for this instance
+		delete(s.args, pid)
 	}
 
 	if len(terminate) > 0 {
@@ -234,4 +252,44 @@ func (s *supSOFO) children() []SupervisorChild {
 		c = append(c, supChild{pid, *spec})
 	}
 	return sortSupChild(c)
+}
+
+func (s *supSOFO) inspect(items ...string) map[string]string {
+	result := make(map[string]string)
+
+	result["type"] = "Simple One For One"
+	result["strategy"] = s.restart.Strategy.String()
+	result["intensity"] = fmt.Sprintf("%d", s.restart.Intensity)
+	result["period"] = fmt.Sprintf("%d", s.restart.Period)
+	result["restarts_count"] = fmt.Sprintf("%d", len(s.restarts))
+
+	specsTotal := len(s.spec)
+	specsDisabled := 0
+
+	// count instances per child spec
+	instancesPerSpec := make(map[gen.Atom]int)
+	instancesWithArgsPerSpec := make(map[gen.Atom]int)
+
+	for pid, spec := range s.pids {
+		instancesPerSpec[spec.Name]++
+		if _, hasArgs := s.args[pid]; hasArgs {
+			instancesWithArgsPerSpec[spec.Name]++
+		}
+	}
+
+	for name, cs := range s.spec {
+		if cs.disabled {
+			specsDisabled++
+		}
+		count := instancesPerSpec[name]
+		countWithArgs := instancesWithArgsPerSpec[name]
+		result[fmt.Sprintf("child:%s", name)] = fmt.Sprintf("%d", count)
+		result[fmt.Sprintf("child:%s:args", name)] = fmt.Sprintf("%d", countWithArgs)
+	}
+
+	result["specs_total"] = fmt.Sprintf("%d", specsTotal)
+	result["specs_disabled"] = fmt.Sprintf("%d", specsDisabled)
+	result["instances_total"] = fmt.Sprintf("%d", len(s.pids))
+
+	return result
 }

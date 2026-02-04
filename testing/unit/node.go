@@ -241,6 +241,16 @@ func (tn *TestNode) ProcessListShortInfo(start, limit int) ([]gen.ProcessShortIn
 	return infos, nil
 }
 
+func (tn *TestNode) ProcessName(pid gen.PID) (gen.Atom, error) {
+	// Simple stub - returns empty name
+	return "", nil
+}
+
+func (tn *TestNode) ProcessPID(name gen.Atom) (gen.PID, error) {
+	// Simple stub - returns error
+	return gen.PID{}, gen.ErrProcessUnknown
+}
+
 func (tn *TestNode) ProcessState(pid gen.PID) (gen.ProcessState, error) {
 	return gen.ProcessStateRunning, nil
 }
@@ -463,21 +473,102 @@ func (tn *TestNode) SendWithOptions(to any, options gen.MessageOptions, message 
 
 func (tn *TestNode) Call(to any, request any) (any, error) {
 	tn.events.Push(CallEvent{
-		From:    tn.PID(),
-		To:      to,
-		Request: request,
+		From:     tn.PID(),
+		To:       to,
+		Request:  request,
+		Timeout:  gen.DefaultRequestTimeout,
+		Priority: gen.MessagePriorityNormal,
 	})
 	return nil, nil
 }
 
 func (tn *TestNode) CallWithTimeout(to any, request any, timeout int) (any, error) {
 	tn.events.Push(CallEvent{
-		From:    tn.PID(),
-		To:      to,
-		Request: request,
-		Timeout: timeout,
+		From:     tn.PID(),
+		To:       to,
+		Request:  request,
+		Timeout:  timeout,
+		Priority: gen.MessagePriorityNormal,
 	})
 	return nil, nil
+}
+
+func (tn *TestNode) CallWithPriority(to any, request any, priority gen.MessagePriority) (any, error) {
+	tn.events.Push(CallEvent{
+		From:     tn.PID(),
+		To:       to,
+		Request:  request,
+		Timeout:  gen.DefaultRequestTimeout,
+		Priority: priority,
+	})
+	return nil, nil
+}
+
+func (tn *TestNode) CallImportant(to any, request any) (any, error) {
+	tn.events.Push(CallEvent{
+		From:      tn.PID(),
+		To:        to,
+		Request:   request,
+		Timeout:   gen.DefaultRequestTimeout,
+		Priority:  gen.MessagePriorityNormal,
+		Important: true,
+	})
+	return nil, nil
+}
+
+func (tn *TestNode) CallPID(to gen.PID, request any, timeout int) (any, error) {
+	tn.events.Push(CallEvent{
+		From:     tn.PID(),
+		To:       to,
+		Request:  request,
+		Timeout:  timeout,
+		Priority: gen.MessagePriorityNormal,
+	})
+	return nil, nil
+}
+
+func (tn *TestNode) CallProcessID(to gen.ProcessID, request any, timeout int) (any, error) {
+	tn.events.Push(CallEvent{
+		From:     tn.PID(),
+		To:       to,
+		Request:  request,
+		Timeout:  timeout,
+		Priority: gen.MessagePriorityNormal,
+	})
+	return nil, nil
+}
+
+func (tn *TestNode) CallAlias(to gen.Alias, request any, timeout int) (any, error) {
+	tn.events.Push(CallEvent{
+		From:     tn.PID(),
+		To:       to,
+		Request:  request,
+		Timeout:  timeout,
+		Priority: gen.MessagePriorityNormal,
+	})
+	return nil, nil
+}
+
+func (tn *TestNode) Inspect(target gen.PID, item ...string) (map[string]string, error) {
+	result := map[string]string{}
+	tn.events.Push(InspectEvent{
+		From:   tn.PID(),
+		Target: target,
+		Items:  item,
+		Result: result,
+	})
+	return result, nil
+}
+
+func (tn *TestNode) InspectMeta(alias gen.Alias, item ...string) (map[string]string, error) {
+	result := map[string]string{}
+	tn.events.Push(InspectMetaEvent{
+		From:   tn.PID(),
+		Target: alias,
+		Items:  item,
+		Result: result,
+	})
+	return result, nil
 }
 
 func (tn *TestNode) SendEvent(name gen.Atom, token gen.Ref, options gen.MessageOptions, message any) error {
@@ -569,6 +660,21 @@ func (tn *TestNode) LoggerLevels(name string) []gen.LogLevel {
 
 func (tn *TestNode) MakeRef() gen.Ref {
 	return makeTestRefWithCreation(tn.options.NodeName, tn.options.NodeCreation)
+}
+
+func (tn *TestNode) MakeRefWithDeadline(deadline int64) (gen.Ref, error) {
+	if deadline < 1 {
+		return gen.Ref{}, gen.ErrIncorrect
+	}
+
+	now := time.Now().Unix()
+	if deadline <= now {
+		return gen.Ref{}, gen.ErrIncorrect
+	}
+
+	ref := makeTestRefWithCreation(tn.options.NodeName, tn.options.NodeCreation)
+	ref.ID[2] = uint64(deadline)
+	return ref, nil
 }
 
 func (tn *TestNode) Commercial() []gen.Version {

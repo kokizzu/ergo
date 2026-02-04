@@ -3,8 +3,10 @@ package gen
 import (
 	"fmt"
 	"hash/crc32"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -50,8 +52,17 @@ type PID struct {
 
 // String
 func (p PID) String() string {
-	return fmt.Sprintf("<%s.%d.%d>", p.Node.CRC32(), int32(p.ID>>32), int32(p.ID))
+	buf := make([]byte, 0, 32)
+	buf = append(buf, '<')
+	buf = append(buf, p.Node.CRC32()...)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(int32(p.ID>>32)), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(int32(p.ID)), 10)
+	buf = append(buf, '>')
+	return string(buf)
 }
+
 func (p PID) MarshalJSON() ([]byte, error) {
 	return []byte("\"" + p.String() + "\""), nil
 }
@@ -62,9 +73,15 @@ type ProcessID struct {
 	Node Atom
 }
 
-// String string representaion of ProcessID value
+// String
 func (p ProcessID) String() string {
-	return fmt.Sprintf("<%s.%s>", p.Node.CRC32(), p.Name)
+	buf := make([]byte, 0, 64)
+	buf = append(buf, '<')
+	buf = append(buf, p.Node.CRC32()...)
+	buf = append(buf, '.')
+	buf = append(buf, p.Name...)
+	buf = append(buf, '>')
+	return string(buf)
 }
 func (p ProcessID) MarshalJSON() ([]byte, error) {
 	return []byte("\"" + p.String() + "\""), nil
@@ -79,8 +96,39 @@ type Ref struct {
 
 // String
 func (r Ref) String() string {
-	return fmt.Sprintf("Ref#<%s.%d.%d.%d>", r.Node.CRC32(), r.ID[0], r.ID[1], r.ID[2])
+	buf := make([]byte, 0, 64)
+	buf = append(buf, "Ref#<"...)
+	buf = append(buf, r.Node.CRC32()...)
+	buf = append(buf, '.')
+	buf = strconv.AppendUint(buf, r.ID[0], 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendUint(buf, r.ID[1], 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendUint(buf, r.ID[2], 10)
+	buf = append(buf, '>')
+	return string(buf)
 }
+
+// Deadline returns the deadline timestamp (unix seconds) stored in ID[2].
+// Returns 0 if no deadline was set.
+func (r Ref) Deadline() uint64 {
+	return r.ID[2]
+}
+
+// IsAlive checks if the reference is still valid (deadline not exceeded).
+// Returns true if no deadline is set (ID[2] == 0) or false if current time is after deadline.
+func (r Ref) IsAlive() bool {
+	deadline := r.ID[2]
+	if deadline == 0 {
+		return true
+	}
+	now := uint64(time.Now().Unix())
+	if now > deadline {
+		return false
+	}
+	return true
+}
+
 func (r Ref) MarshalJSON() ([]byte, error) {
 	return []byte("\"" + r.String() + "\""), nil
 }
@@ -90,7 +138,17 @@ type Alias Ref
 
 // String
 func (a Alias) String() string {
-	return fmt.Sprintf("Alias#<%s.%d.%d.%d>", a.Node.CRC32(), a.ID[0], a.ID[1], a.ID[2])
+	buf := make([]byte, 0, 64)
+	buf = append(buf, "Alias#<"...)
+	buf = append(buf, a.Node.CRC32()...)
+	buf = append(buf, '.')
+	buf = strconv.AppendUint(buf, a.ID[0], 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendUint(buf, a.ID[1], 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendUint(buf, a.ID[2], 10)
+	buf = append(buf, '>')
+	return string(buf)
 }
 
 func (a Alias) MarshalJSON() ([]byte, error) {
@@ -108,8 +166,15 @@ type EventOptions struct {
 	Buffer int
 }
 
+// String
 func (e Event) String() string {
-	return fmt.Sprintf("Event#<%s:%s>", e.Node.CRC32(), e.Name)
+	buf := make([]byte, 0, 64)
+	buf = append(buf, "Event#<"...)
+	buf = append(buf, e.Node.CRC32()...)
+	buf = append(buf, ':')
+	buf = append(buf, e.Name...)
+	buf = append(buf, '>')
+	return string(buf)
 }
 func (e Event) MarshalJSON() ([]byte, error) {
 	return []byte("\"" + e.String() + "\""), nil

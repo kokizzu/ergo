@@ -50,10 +50,12 @@ type Core interface {
 
 	RouteSpawn(node Atom, name Atom, options ProcessOptionsExtra, source Atom) (PID, error)
 	RouteApplicationStart(name Atom, mode ApplicationMode, options ApplicationOptionsExtra, source Atom) error
+	RouteApplicationInfo(name Atom) (ApplicationInfo, error)
 
 	RouteNodeDown(node Atom, reason error)
 
 	MakeRef() Ref
+	MakeRefWithDeadline(deadline int64) (Ref, error)
 	Name() Atom
 	Creation() int64
 
@@ -66,3 +68,15 @@ type Core interface {
 const (
 	CoreEvent Atom = "core"
 )
+
+// CoreTargetManager
+// bridge to core from target manager
+type CoreTargetManager interface {
+	Name() Atom
+	PID() PID
+	Log() Log
+	RouteSendPID(from PID, to PID, options MessageOptions, message any) error
+	RouteSendExitMessages(from PID, to []PID, message any) error
+	RouteSendEventMessages(from PID, to []PID, options MessageOptions, message MessageEvent) error
+	GetConnection(node Atom) (Connection, error)
+}

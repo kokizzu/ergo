@@ -520,6 +520,11 @@ func (n *network) GetConnection(name gen.Atom) (gen.Connection, error) {
 		return v.(gen.Connection), nil
 	}
 
+	registrar := n.registrar
+	if registrar == nil {
+		return nil, gen.ErrNoRoute
+	}
+
 	if lib.Trace() {
 		n.node.Log().Trace("trying to make connection with %s", name)
 	}
@@ -622,7 +627,7 @@ func (n *network) GetConnection(name gen.Atom) (gen.Connection, error) {
 	}
 
 	// resolve it
-	if nr, err := n.registrar.Resolver().Resolve(name); err == nil {
+	if nr, err := registrar.Resolver().Resolve(name); err == nil {
 		if lib.Trace() {
 			n.node.Log().Trace("resolved %d route[s] for %s", len(nr), name)
 		}
@@ -656,7 +661,7 @@ func (n *network) GetConnection(name gen.Atom) (gen.Connection, error) {
 	}
 
 	// resolve proxy
-	if pr, err := n.registrar.Resolver().ResolveProxy(name); err == nil {
+	if pr, err := registrar.Resolver().ResolveProxy(name); err == nil {
 		if lib.Trace() {
 			n.node.Log().Trace("resolved %d proxy routes for %s", len(pr), name)
 		}
@@ -721,6 +726,21 @@ func (n *network) connect(name gen.Atom, route gen.NetworkRoute) (gen.Connection
 	if route.Route.TLS {
 		tlsconfig := &tls.Config{
 			InsecureSkipVerify: route.InsecureSkipVerify,
+			MinVersion:         tls.VersionTLS12,
+		}
+		// use client certificate if provided
+		if route.Cert != nil {
+			tlsconfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				cert := route.Cert.GetCertificate()
+				return &cert, nil
+			}
+			// check for mTLS support (CA pool for server verification, server name)
+			if cam, ok := route.Cert.(gen.CertAuthManager); ok {
+				tlsconfig.RootCAs = cam.RootCAs()
+				if serverName := cam.ServerName(); serverName != "" {
+					tlsconfig.ServerName = serverName
+				}
+			}
 		}
 		tlsdialer := tls.Dialer{
 			NetDialer: dialer,
@@ -954,6 +974,7 @@ func (n *network) start(options gen.NetworkOptions) error {
 			Node:   n.node.Name(),
 			Name:   info.Name,
 			Weight: info.Weight,
+			Tags:   info.Tags,
 			Mode:   info.Mode,
 		}
 		appRoutes = append(appRoutes, r)
@@ -1001,8 +1022,16 @@ func (n *network) start(options gen.NetworkOptions) error {
 		}
 
 		n.acceptors = append(n.acceptors, acceptor)
+
+		// determine port to advertise in route
+		routePort := acceptor.port
+		if acceptor.route_port > 0 {
+			routePort = acceptor.route_port
+		}
+
 		r := gen.Route{
-			Port:             acceptor.port,
+			Host:             acceptor.route_host,
+			Port:             routePort,
 			TLS:              acceptor.cert_manager != nil,
 			HandshakeVersion: acceptor.handshake.Version(),
 			ProtoVersion:     acceptor.proto.Version(),
@@ -1029,7 +1058,12 @@ func (n *network) start(options gen.NetworkOptions) error {
 			for i := range n.acceptors {
 				n.acceptors[i].l.Close()
 			}
-			return fmt.Errorf("unable to register node on %s (%s): %s", registrarInfo.Server, registrarInfo.Version, err)
+			return fmt.Errorf(
+				"unable to register node on %s (%s): %s",
+				registrarInfo.Server,
+				registrarInfo.Version,
+				err,
+			)
 		}
 		acceptor.registrar_custom = true
 	}
@@ -1096,6 +1130,8 @@ func (n *network) startAcceptor(a gen.AcceptorOptions) (*acceptor, error) {
 		cert_manager:     cert_manager,
 		max_message_size: a.MaxMessageSize,
 		atom_mapping:     make(map[gen.Atom]gen.Atom),
+		route_host:       a.RouteHost,
+		route_port:       a.RoutePort,
 	}
 	if a.Cookie == "" {
 		acceptor.cookie = n.cookie
@@ -1130,7 +1166,15 @@ func (n *network) startAcceptor(a gen.AcceptorOptions) (*acceptor, error) {
 		config := &tls.Config{
 			GetCertificate:     acceptor.cert_manager.GetCertificateFunc(),
 			InsecureSkipVerify: a.InsecureSkipVerify,
+			MinVersion:         tls.VersionTLS12,
 		}
+
+		// check for mTLS support
+		if cam, ok := acceptor.cert_manager.(gen.CertAuthManager); ok {
+			config.ClientAuth = cam.ClientAuth()
+			config.ClientCAs = cam.ClientCAs()
+		}
+
 		acceptor.l = tls.NewListener(acceptor.l, config)
 	}
 

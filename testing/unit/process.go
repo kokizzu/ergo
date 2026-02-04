@@ -157,6 +157,35 @@ func (tp *TestProcess) SendAfter(to any, message any, after time.Duration) (gen.
 	return gen.CancelFunc(func() bool { return true }), nil
 }
 
+func (tp *TestProcess) SendWithPriorityAfter(to any, message any, priority gen.MessagePriority, after time.Duration) (gen.CancelFunc, error) {
+	tp.events.Push(SendEvent{
+		From:     tp.pid,
+		To:       to,
+		Message:  message,
+		Priority: priority,
+		After:    after,
+	})
+	return gen.CancelFunc(func() bool { return true }), nil
+}
+
+func (tp *TestProcess) SendExitAfter(to gen.PID, reason error, after time.Duration) (gen.CancelFunc, error) {
+	tp.events.Push(ExitEvent{
+		To:     to,
+		Reason: reason,
+		After:  after,
+	})
+	return gen.CancelFunc(func() bool { return true }), nil
+}
+
+func (tp *TestProcess) SendExitMetaAfter(to gen.Alias, reason error, after time.Duration) (gen.CancelFunc, error) {
+	tp.events.Push(ExitMetaEvent{
+		Meta:   to,
+		Reason: reason,
+		After:  after,
+	})
+	return gen.CancelFunc(func() bool { return true }), nil
+}
+
 func (tp *TestProcess) SendResponse(to gen.PID, ref gen.Ref, response any) error {
 	tp.events.Push(SendResponseEvent{
 		From:     tp.pid,
@@ -179,11 +208,34 @@ func (tp *TestProcess) SendResponseError(to gen.PID, ref gen.Ref, err error) err
 	return nil
 }
 
+func (tp *TestProcess) SendResponseImportant(to gen.PID, ref gen.Ref, response any) error {
+	tp.events.Push(SendResponseEvent{
+		From:     tp.pid,
+		To:       to,
+		Response: response,
+		Ref:      ref,
+		Priority: tp.options.Priority,
+	})
+	return nil
+}
+
+func (tp *TestProcess) SendResponseErrorImportant(to gen.PID, ref gen.Ref, err error) error {
+	tp.events.Push(SendResponseErrorEvent{
+		From:     tp.pid,
+		To:       to,
+		Error:    err,
+		Ref:      ref,
+		Priority: tp.options.Priority,
+	})
+	return nil
+}
+
 func (tp *TestProcess) Call(to any, request any) (any, error) {
 	event := CallEvent{
 		From:    tp.pid,
 		To:      to,
 		Request: request,
+		Timeout: gen.DefaultRequestTimeout,
 	}
 	tp.events.Push(event)
 	return nil, nil
@@ -202,9 +254,11 @@ func (tp *TestProcess) CallWithTimeout(to any, request any, timeout int) (any, e
 
 func (tp *TestProcess) CallWithPriority(to any, request any, priority gen.MessagePriority) (any, error) {
 	event := CallEvent{
-		From:    tp.pid,
-		To:      to,
-		Request: request,
+		From:     tp.pid,
+		To:       to,
+		Request:  request,
+		Timeout:  gen.DefaultRequestTimeout,
+		Priority: priority,
 	}
 	tp.events.Push(event)
 	return nil, nil
@@ -212,9 +266,11 @@ func (tp *TestProcess) CallWithPriority(to any, request any, priority gen.Messag
 
 func (tp *TestProcess) CallImportant(to any, request any) (any, error) {
 	event := CallEvent{
-		From:    tp.pid,
-		To:      to,
-		Request: request,
+		From:      tp.pid,
+		To:        to,
+		Request:   request,
+		Timeout:   gen.DefaultRequestTimeout,
+		Important: true,
 	}
 	tp.events.Push(event)
 	return nil, nil
@@ -654,15 +710,26 @@ func (tp *TestProcess) RemoteSpawnRegister(
 	return result, nil
 }
 
-// Missing inspect method
 func (tp *TestProcess) Inspect(target gen.PID, item ...string) (map[string]string, error) {
-	// For testing, return empty result
-	return map[string]string{}, nil
+	result := map[string]string{}
+	tp.events.Push(InspectEvent{
+		From:   tp.pid,
+		Target: target,
+		Items:  item,
+		Result: result,
+	})
+	return result, nil
 }
 
-func (tp *TestProcess) InspectMeta(meta gen.Alias, item ...string) (map[string]string, error) {
-	// For testing, return empty result
-	return map[string]string{}, nil
+func (tp *TestProcess) InspectMeta(alias gen.Alias, item ...string) (map[string]string, error) {
+	result := map[string]string{}
+	tp.events.Push(InspectMetaEvent{
+		From:   tp.pid,
+		Target: alias,
+		Items:  item,
+		Result: result,
+	})
+	return result, nil
 }
 
 // Missing Events method

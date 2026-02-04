@@ -3,7 +3,6 @@ package node
 import (
 	"errors"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,8 +25,6 @@ type process struct {
 
 	// registered aliases
 	aliases []gen.Alias
-	// registered events
-	events sync.Map // gen.Atom ->..
 
 	behavior  gen.ProcessBehavior
 	sbehavior string
@@ -65,9 +62,11 @@ type process struct {
 }
 
 type response struct {
-	message any
-	err     error
-	ref     gen.Ref
+	message   any
+	err       error
+	ref       gen.Ref
+	from      gen.PID
+	important bool
 }
 
 // gen.Process implementation
@@ -93,9 +92,6 @@ func (p *process) Parent() gen.PID {
 }
 
 func (p *process) Uptime() int64 {
-	if p.isAlive() == false {
-		return 0
-	}
 	return time.Now().Unix() - p.creation
 }
 
@@ -104,9 +100,21 @@ func (p *process) Spawn(
 	options gen.ProcessOptions,
 	args ...any,
 ) (gen.PID, error) {
-	if p.isStateIRW() == false {
+	if p.isStateIR() == false {
 		return gen.PID{}, gen.ErrNotAllowed
 	}
+
+	// calculate deadline
+	timeout := options.InitTimeout
+	if timeout == 0 {
+		timeout = gen.DefaultRequestTimeout
+	}
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := p.node.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return gen.PID{}, err
+	}
+
 	opts := gen.ProcessOptionsExtra{
 		ProcessOptions: options,
 		ParentPID:      p.pid,
@@ -115,6 +123,7 @@ func (p *process) Spawn(
 		ParentLogLevel: p.log.level,
 		Application:    p.application,
 		Args:           args,
+		Ref:            ref,
 	}
 
 	pid, err := p.node.spawn(factory, opts)
@@ -125,7 +134,7 @@ func (p *process) Spawn(
 	if options.LinkChild {
 		// method LinkPID is not allowed to be used in the initialization state,
 		// so we use linking manually.
-		p.node.targetManager.AddLink(p.pid, pid)
+		p.node.targets.LinkPID(p.pid, pid)
 	}
 	return pid, err
 }
@@ -137,8 +146,19 @@ func (p *process) SpawnRegister(
 	args ...any,
 ) (gen.PID, error) {
 
-	if p.isStateIRW() == false {
+	if p.isStateIR() == false {
 		return gen.PID{}, gen.ErrNotAllowed
+	}
+
+	// calculate deadline
+	timeout := options.InitTimeout
+	if timeout == 0 {
+		timeout = gen.DefaultRequestTimeout
+	}
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := p.node.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return gen.PID{}, err
 	}
 
 	opts := gen.ProcessOptionsExtra{
@@ -150,6 +170,7 @@ func (p *process) SpawnRegister(
 		ParentLogLevel: p.log.level,
 		Application:    p.application,
 		Args:           args,
+		Ref:            ref,
 	}
 	pid, err := p.node.spawn(factory, opts)
 	if err != nil {
@@ -159,27 +180,31 @@ func (p *process) SpawnRegister(
 	if options.LinkChild {
 		// method LinkPID is not allowed to be used in the initialization state,
 		// so we use linking manually.
-		p.node.targetManager.AddLink(p.pid, pid)
+		p.node.targets.LinkPID(p.pid, pid)
 	}
 	return pid, err
 }
 
 func (p *process) SpawnMeta(behavior gen.MetaBehavior, options gen.MetaOptions) (gen.Alias, error) {
 	var alias gen.Alias
-
-	// use isAlive instead of isStateIRW because
-	// any meta process should be able to spawn other meta process
-	if p.isAlive() == false {
+	// use isStateIR - meta can spawn in Init or Running
+	if p.isStateIR() == false {
 		return alias, gen.ErrNotAllowed
 	}
+	return p.spawnMeta(behavior, options)
+}
+
+func (p *process) spawnMeta(behavior gen.MetaBehavior, options gen.MetaOptions) (gen.Alias, error) {
+	var alias gen.Alias
 
 	if behavior == nil {
 		return alias, errors.New("behavior is nil")
 	}
 
 	m := &meta{
-		p:        p,
-		behavior: behavior,
+		p:           p,
+		behavior:    behavior,
+		compression: options.Compression,
 	}
 	switch options.SendPriority {
 	case gen.MessagePriorityHigh:
@@ -231,7 +256,7 @@ func (p *process) RemoteSpawn(
 	args ...any,
 ) (gen.PID, error) {
 
-	if p.isStateIRW() == false {
+	if p.isStateIR() == false {
 		return gen.PID{}, gen.ErrNotAllowed
 	}
 
@@ -258,7 +283,7 @@ func (p *process) RemoteSpawn(
 	if opts.LinkChild {
 		// method LinkPID is not allowed to be used in the initialization state,
 		// so we use linking manually.
-		p.node.targetManager.AddLink(p.pid, pid)
+		p.node.targets.LinkPID(p.pid, pid)
 	}
 
 	return pid, err
@@ -272,7 +297,7 @@ func (p *process) RemoteSpawnRegister(
 	args ...any,
 ) (gen.PID, error) {
 
-	if p.isStateIRW() == false {
+	if p.isStateIR() == false {
 		return gen.PID{}, gen.ErrNotAllowed
 	}
 
@@ -296,7 +321,7 @@ func (p *process) RemoteSpawnRegister(
 	if opts.LinkChild {
 		// method LinkPID is not allowed to be used in the initialization state,
 		// so we use linking manually.
-		p.node.targetManager.AddLink(p.pid, pid)
+		p.node.targets.LinkPID(p.pid, pid)
 	}
 
 	return pid, err
@@ -307,7 +332,7 @@ func (p *process) State() gen.ProcessState {
 }
 
 func (p *process) RegisterName(name gen.Atom) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 	if err := p.node.RegisterName(name, p.pid); err != nil {
@@ -319,7 +344,7 @@ func (p *process) RegisterName(name gen.Atom) error {
 }
 
 func (p *process) UnregisterName() error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 	_, err := p.node.UnregisterName(p.name)
@@ -327,10 +352,6 @@ func (p *process) UnregisterName() error {
 }
 
 func (p *process) EnvList() map[gen.Env]any {
-	if p.isAlive() == false {
-		return nil
-	}
-
 	env := make(map[gen.Env]any)
 	p.env.Range(func(k, v any) bool {
 		env[gen.Env(k.(string))] = v
@@ -340,7 +361,7 @@ func (p *process) EnvList() map[gen.Env]any {
 }
 
 func (p *process) SetEnv(name gen.Env, value any) {
-	if p.isAlive() == false {
+	if p.isStateIR() == false {
 		return
 	}
 	if value == nil {
@@ -351,17 +372,11 @@ func (p *process) SetEnv(name gen.Env, value any) {
 }
 
 func (p *process) Env(name gen.Env) (any, bool) {
-	if p.isAlive() == false {
-		return nil, false
-	}
 	x, y := p.env.Load(name.String())
 	return x, y
 }
 
 func (p *process) EnvDefault(name gen.Env, defaultValue any) any {
-	if p.isAlive() == false {
-		return defaultValue
-	}
 	if value, ok := p.Env(name); ok {
 		return value
 	}
@@ -373,8 +388,8 @@ func (p *process) Compression() bool {
 }
 
 func (p *process) SetCompression(enable bool) error {
-	if p.isAlive() == false {
-		return gen.ErrProcessTerminated
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
 	}
 	p.compression.Enable = enable
 	return nil
@@ -385,8 +400,8 @@ func (p *process) CompressionType() gen.CompressionType {
 }
 
 func (p *process) SetCompressionType(ctype gen.CompressionType) error {
-	if p.isAlive() == false {
-		return gen.ErrProcessTerminated
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
 	}
 
 	switch ctype {
@@ -406,8 +421,8 @@ func (p *process) CompressionLevel() gen.CompressionLevel {
 }
 
 func (p *process) SetCompressionLevel(level gen.CompressionLevel) error {
-	if p.isAlive() == false {
-		return gen.ErrProcessTerminated
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
 	}
 
 	switch level {
@@ -427,8 +442,8 @@ func (p *process) CompressionThreshold() int {
 }
 
 func (p *process) SetCompressionThreshold(threshold int) error {
-	if p.isAlive() == false {
-		return gen.ErrProcessTerminated
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
 	}
 	if threshold < gen.DefaultCompressionThreshold {
 		return gen.ErrIncorrect
@@ -442,8 +457,8 @@ func (p *process) SendPriority() gen.MessagePriority {
 }
 
 func (p *process) SetSendPriority(priority gen.MessagePriority) error {
-	if p.isAlive() == false {
-		return gen.ErrProcessTerminated
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
 	}
 
 	switch priority {
@@ -458,8 +473,8 @@ func (p *process) SetSendPriority(priority gen.MessagePriority) error {
 }
 
 func (p *process) SetKeepNetworkOrder(order bool) error {
-	if p.isAlive() == false {
-		return gen.ErrProcessTerminated
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
 	}
 
 	p.keeporder = order
@@ -471,8 +486,8 @@ func (p *process) KeepNetworkOrder() bool {
 }
 
 func (p *process) SetImportantDelivery(important bool) error {
-	if p.isAlive() == false {
-		return gen.ErrProcessTerminated
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
 	}
 
 	p.important = important
@@ -484,9 +499,8 @@ func (p *process) ImportantDelivery() bool {
 }
 
 func (p *process) CreateAlias() (gen.Alias, error) {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.Alias{}, gen.ErrNotAllowed
-
 	}
 	alias := gen.Alias(p.node.MakeRef())
 	if err := p.node.registerAlias(alias, p); err != nil {
@@ -498,7 +512,7 @@ func (p *process) CreateAlias() (gen.Alias, error) {
 }
 
 func (p *process) DeleteAlias(alias gen.Alias) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -551,8 +565,11 @@ func (p *process) Send(to any, message any) error {
 }
 
 func (p *process) SendImportant(to any, message any) error {
-	var important bool
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
+	}
 
+	var important bool
 	important, p.important = p.important, true
 	err := p.Send(to, message)
 	p.important = important
@@ -561,8 +578,8 @@ func (p *process) SendImportant(to any, message any) error {
 }
 
 func (p *process) SendPID(to gen.PID, message any) error {
-	// allow to send even being in sleep state (meta-process uses this method)
-	if p.isAlive() == false {
+	// allow to send in Init, Running, Terminated states
+	if p.isStateIRT() == false {
 		return gen.ErrNotAllowed
 	}
 	if lib.Trace() {
@@ -587,7 +604,7 @@ func (p *process) SendPID(to gen.PID, message any) error {
 		qm.Type = gen.MailboxMessageTypeRegular
 		qm.Target = to
 		qm.Message = message
-		
+
 		var queue lib.QueueMPSC
 		switch p.priority {
 		case gen.MessagePriorityHigh:
@@ -601,7 +618,7 @@ func (p *process) SendPID(to gen.PID, message any) error {
 		if ok := queue.Push(qm); ok == false {
 			return gen.ErrProcessMailboxFull
 		}
-		
+
 		atomic.AddUint64(&p.messagesIn, 1)
 		p.run()
 		return nil
@@ -645,7 +662,7 @@ func (p *process) SendPID(to gen.PID, message any) error {
 }
 
 func (p *process) SendProcessID(to gen.ProcessID, message any) error {
-	if p.isAlive() == false {
+	if p.isStateIRT() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -691,7 +708,7 @@ func (p *process) SendProcessID(to gen.ProcessID, message any) error {
 }
 
 func (p *process) SendAlias(to gen.Alias, message any) error {
-	if p.isAlive() == false {
+	if p.isStateIRT() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -737,7 +754,7 @@ func (p *process) SendAlias(to gen.Alias, message any) error {
 }
 
 func (p *process) SendAfter(to any, message any, after time.Duration) (gen.CancelFunc, error) {
-	if p.isAlive() == false {
+	if p.isStateIR() == false {
 		return nil, gen.ErrNotAllowed
 	}
 	return time.AfterFunc(after, func() {
@@ -770,8 +787,47 @@ func (p *process) SendAfter(to any, message any, after time.Duration) (gen.Cance
 	}).Stop, nil
 }
 
+func (p *process) SendWithPriorityAfter(
+	to any,
+	message any,
+	priority gen.MessagePriority,
+	after time.Duration,
+) (gen.CancelFunc, error) {
+	if p.isStateIR() == false {
+		return nil, gen.ErrNotAllowed
+	}
+	return time.AfterFunc(after, func() {
+		var err error
+		if lib.Trace() {
+			p.log.Trace("SendWithPriorityAfter %s to %s with priority %s", after, to, priority)
+		}
+		// we can't use p.Send(...) because it checks the process state
+		// and returns gen.ErrNotAllowed, so use p.node.Route* methods for that
+		options := gen.MessageOptions{
+			Priority:         priority,
+			Compression:      p.compression,
+			KeepNetworkOrder: p.keeporder,
+			// ImportantDelivery: ignore on sending with delay
+		}
+		switch t := to.(type) {
+		case gen.Atom:
+			err = p.node.RouteSendProcessID(p.pid, gen.ProcessID{Name: t, Node: p.node.name}, options, message)
+		case gen.PID:
+			err = p.node.RouteSendPID(p.pid, t, options, message)
+		case gen.ProcessID:
+			err = p.node.RouteSendProcessID(p.pid, t, options, message)
+		case gen.Alias:
+			err = p.node.RouteSendAlias(p.pid, t, options, message)
+		}
+
+		if err == nil {
+			atomic.AddUint64(&p.messagesOut, 1)
+		}
+	}).Stop, nil
+}
+
 func (p *process) SendEvent(name gen.Atom, token gen.Ref, message any) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -800,7 +856,7 @@ func (p *process) SendEvent(name gen.Atom, token gen.Ref, message any) error {
 }
 
 func (p *process) SendExit(to gen.PID, reason error) error {
-	if p.isStateRW() == false {
+	if p.isStateIRT() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -825,8 +881,35 @@ func (p *process) SendExit(to gen.PID, reason error) error {
 	return nil
 }
 
+func (p *process) SendExitAfter(to gen.PID, reason error, after time.Duration) (gen.CancelFunc, error) {
+	if p.isStateIR() == false {
+		return nil, gen.ErrNotAllowed
+	}
+
+	if reason == nil {
+		return nil, gen.ErrIncorrect
+	}
+
+	switch to {
+	case p.pid, p.parent, p.leader:
+		p.log.Warning("sending exit-signal to itself, parent, or leader process is not allowed")
+		return nil, gen.ErrNotAllowed
+	}
+
+	return time.AfterFunc(after, func() {
+		if lib.Trace() {
+			p.log.Trace("SendExitAfter %s to %s with reason %q", after, to, reason)
+		}
+
+		err := p.node.RouteSendExit(p.pid, to, reason)
+		if err == nil {
+			atomic.AddUint64(&p.messagesOut, 1)
+		}
+	}).Stop, nil
+}
+
 func (p *process) SendExitMeta(alias gen.Alias, reason error) error {
-	if p.isStateRW() == false {
+	if p.isStateIRT() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -866,38 +949,148 @@ func (p *process) SendExitMeta(alias gen.Alias, reason error) error {
 	return nil
 }
 
+func (p *process) SendExitMetaAfter(alias gen.Alias, reason error, after time.Duration) (gen.CancelFunc, error) {
+	if p.isStateIR() == false {
+		return nil, gen.ErrNotAllowed
+	}
+
+	if reason == nil {
+		return nil, gen.ErrIncorrect
+	}
+
+	// Validate alias exists before scheduling
+	value, found := p.node.aliases.Load(alias)
+	if found == false {
+		return nil, gen.ErrAliasUnknown
+	}
+
+	metap := value.(*process)
+	if alive := metap.isAlive(); alive == false {
+		return nil, gen.ErrProcessTerminated
+	}
+
+	_, found = metap.metas.Load(alias)
+	if found == false {
+		return nil, gen.ErrMetaUnknown
+	}
+
+	return time.AfterFunc(after, func() {
+		if lib.Trace() {
+			p.log.Trace("SendExitMetaAfter %s to %s with reason %q", after, alias, reason)
+		}
+
+		value, found := p.node.aliases.Load(alias)
+		if found == false {
+			return
+		}
+
+		metap := value.(*process)
+		if alive := metap.isAlive(); alive == false {
+			return
+		}
+
+		value, found = metap.metas.Load(alias)
+		if found == false {
+			return
+		}
+
+		m := value.(*meta)
+		// send exit signal to the meta process
+		qm := gen.TakeMailboxMessage()
+		qm.From = p.pid
+		qm.Type = gen.MailboxMessageTypeExit
+		qm.Message = reason
+
+		if ok := m.system.Push(qm); ok == false {
+			return
+		}
+
+		atomic.AddUint64(&m.messagesIn, 1)
+		atomic.AddUint64(&p.messagesOut, 1)
+		m.handle()
+	}).Stop, nil
+}
+
 func (p *process) SendResponse(to gen.PID, ref gen.Ref, message any) error {
-	if p.isAlive() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 	if lib.Trace() {
 		p.log.Trace("SendResponse to %s with %s", to, ref)
 	}
 	options := gen.MessageOptions{
-		Ref:              ref,
-		Priority:         p.priority,
-		Compression:      p.compression,
-		KeepNetworkOrder: p.keeporder,
+		Ref:               ref,
+		Priority:          p.priority,
+		Compression:       p.compression,
+		KeepNetworkOrder:  p.keeporder,
+		ImportantDelivery: p.important,
 	}
 	atomic.AddUint64(&p.messagesOut, 1)
 	return p.node.RouteSendResponse(p.pid, to, options, message)
 }
 
+func (p *process) SendResponseImportant(to gen.PID, ref gen.Ref, message any) error {
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
+	}
+	if lib.Trace() {
+		p.log.Trace("SendResponseImportant to %s with %s", to, ref)
+	}
+	options := gen.MessageOptions{
+		Ref:               ref,
+		Priority:          p.priority,
+		Compression:       p.compression,
+		KeepNetworkOrder:  p.keeporder,
+		ImportantDelivery: true,
+	}
+	if err := p.node.RouteSendResponse(p.pid, to, options, message); err != nil {
+		return err
+	}
+	atomic.AddUint64(&p.messagesOut, 1)
+
+	_, err := p.waitResponse(options.Ref, gen.DefaultRequestTimeout)
+	return err
+}
+
 func (p *process) SendResponseError(to gen.PID, ref gen.Ref, err error) error {
-	if p.isAlive() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 	if lib.Trace() {
 		p.log.Trace("SendResponseError to %s with %s", to, ref)
 	}
 	options := gen.MessageOptions{
-		Ref:              ref,
-		Priority:         p.priority,
-		Compression:      p.compression,
-		KeepNetworkOrder: p.keeporder,
+		Ref:               ref,
+		Priority:          p.priority,
+		Compression:       p.compression,
+		KeepNetworkOrder:  p.keeporder,
+		ImportantDelivery: p.important,
 	}
 	atomic.AddUint64(&p.messagesOut, 1)
 	return p.node.RouteSendResponseError(p.pid, to, options, err)
+}
+
+func (p *process) SendResponseErrorImportant(to gen.PID, ref gen.Ref, err error) error {
+	if p.isStateIR() == false {
+		return gen.ErrNotAllowed
+	}
+	if lib.Trace() {
+		p.log.Trace("SendResponseErrorImportant to %s with %s", to, ref)
+	}
+	options := gen.MessageOptions{
+		Ref:               ref,
+		Priority:          p.priority,
+		Compression:       p.compression,
+		KeepNetworkOrder:  p.keeporder,
+		ImportantDelivery: true,
+	}
+	if err := p.node.RouteSendResponseError(p.pid, to, options, err); err != nil {
+		return err
+	}
+	atomic.AddUint64(&p.messagesOut, 1)
+
+	_, err = p.waitResponse(options.Ref, gen.DefaultRequestTimeout)
+	return err
 }
 
 func (p *process) CallWithPriority(to any, request any, priority gen.MessagePriority) (any, error) {
@@ -938,15 +1131,25 @@ func (p *process) CallWithTimeout(to any, request any, timeout int) (any, error)
 }
 
 func (p *process) CallPID(to gen.PID, message any, timeout int) (any, error) {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return nil, gen.ErrNotAllowed
 	}
 	if to == p.pid {
 		return nil, gen.ErrNotAllowed
 	}
 
+	if timeout < 1 {
+		timeout = gen.DefaultRequestTimeout
+	}
+
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := p.node.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return nil, err
+	}
+
 	options := gen.MessageOptions{
-		Ref:               p.node.MakeRef(),
+		Ref:               ref,
 		Priority:          p.priority,
 		Compression:       p.compression,
 		KeepNetworkOrder:  p.keeporder,
@@ -962,19 +1165,26 @@ func (p *process) CallPID(to gen.PID, message any, timeout int) (any, error) {
 	}
 
 	atomic.AddUint64(&p.messagesOut, 1)
-	if timeout < 1 {
-		timeout = gen.DefaultRequestTimeout
-	}
 	return p.waitResponse(options.Ref, timeout)
 }
 
 func (p *process) CallProcessID(to gen.ProcessID, message any, timeout int) (any, error) {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return nil, gen.ErrNotAllowed
 	}
 
+	if timeout < 1 {
+		timeout = gen.DefaultRequestTimeout
+	}
+
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := p.node.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return nil, err
+	}
+
 	options := gen.MessageOptions{
-		Ref:               p.node.MakeRef(),
+		Ref:               ref,
 		Priority:          p.priority,
 		Compression:       p.compression,
 		KeepNetworkOrder:  p.keeporder,
@@ -987,19 +1197,26 @@ func (p *process) CallProcessID(to gen.ProcessID, message any, timeout int) (any
 		return nil, err
 	}
 	atomic.AddUint64(&p.messagesOut, 1)
-	if timeout < 1 {
-		timeout = gen.DefaultRequestTimeout
-	}
 	return p.waitResponse(options.Ref, timeout)
 }
 
 func (p *process) CallAlias(to gen.Alias, message any, timeout int) (any, error) {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return nil, gen.ErrNotAllowed
 	}
 
+	if timeout < 1 {
+		timeout = gen.DefaultRequestTimeout
+	}
+
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := p.node.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return nil, err
+	}
+
 	options := gen.MessageOptions{
-		Ref:               p.node.MakeRef(),
+		Ref:               ref,
 		Priority:          p.priority,
 		Compression:       p.compression,
 		KeepNetworkOrder:  p.keeporder,
@@ -1014,14 +1231,11 @@ func (p *process) CallAlias(to gen.Alias, message any, timeout int) (any, error)
 		return nil, err
 	}
 	atomic.AddUint64(&p.messagesOut, 1)
-	if timeout < 1 {
-		timeout = gen.DefaultRequestTimeout
-	}
 	return p.waitResponse(options.Ref, timeout)
 }
 
 func (p *process) Inspect(target gen.PID, item ...string) (map[string]string, error) {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return nil, gen.ErrNotAllowed
 	}
 
@@ -1068,7 +1282,7 @@ func (p *process) Inspect(target gen.PID, item ...string) (map[string]string, er
 }
 
 func (p *process) InspectMeta(alias gen.Alias, item ...string) (map[string]string, error) {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return nil, gen.ErrNotAllowed
 	}
 
@@ -1122,7 +1336,7 @@ func (p *process) InspectMeta(alias gen.Alias, item ...string) (map[string]strin
 
 func (p *process) RegisterEvent(name gen.Atom, options gen.EventOptions) (gen.Ref, error) {
 	var empty gen.Ref
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return empty, gen.ErrNotAllowed
 	}
 
@@ -1130,16 +1344,11 @@ func (p *process) RegisterEvent(name gen.Atom, options gen.EventOptions) (gen.Re
 		p.log.Trace("process RegisterEvent %s", name)
 	}
 
-	token, err := p.node.registerEvent(name, p.pid, options)
-	if err != nil {
-		return token, err
-	}
-	p.events.Store(name, true)
-	return token, nil
+	return p.node.registerEvent(name, p.pid, options)
 }
 
 func (p *process) UnregisterEvent(name gen.Atom) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -1147,21 +1356,16 @@ func (p *process) UnregisterEvent(name gen.Atom) error {
 		p.log.Trace("process UnregisterEvent %s", name)
 	}
 
-	if err := p.node.unregisterEvent(name, p.pid); err != nil {
-		return err
-	}
-
-	p.events.Delete(name)
-	return nil
+	return p.node.unregisterEvent(name, p.pid)
 }
 
 func (p *process) Events() []gen.Atom {
-	events := []gen.Atom{}
-	p.events.Range(func(k, _ any) bool {
-		events = append(events, k.(gen.Atom))
-		return true
-	})
-	return events
+	events := p.node.targets.EventsFor(p.pid)
+	names := make([]gen.Atom, len(events))
+	for i, event := range events {
+		names[i] = event.Name
+	}
+	return names
 }
 
 func (p *process) Link(target any) error {
@@ -1194,7 +1398,7 @@ func (p *process) Unlink(target any) error {
 }
 
 func (p *process) LinkPID(target gen.PID) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -1202,7 +1406,7 @@ func (p *process) LinkPID(target gen.PID) error {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) {
+	if p.node.targets.HasLink(p.pid, target) {
 		return gen.ErrTargetExist
 	}
 
@@ -1214,15 +1418,21 @@ func (p *process) LinkPID(target gen.PID) error {
 		return err
 	}
 
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.UnlinkPID(p.pid, target)
+		return gen.ErrProcessTerminated
+	}
+
 	return nil
 }
 
 func (p *process) UnlinkPID(target gen.PID) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) == false {
+	if p.node.targets.HasLink(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
@@ -1238,7 +1448,7 @@ func (p *process) UnlinkPID(target gen.PID) error {
 }
 
 func (p *process) LinkProcessID(target gen.ProcessID) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -1246,7 +1456,7 @@ func (p *process) LinkProcessID(target gen.ProcessID) error {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) {
+	if p.node.targets.HasLink(p.pid, target) {
 		return gen.ErrTargetExist
 	}
 
@@ -1258,15 +1468,21 @@ func (p *process) LinkProcessID(target gen.ProcessID) error {
 		return err
 	}
 
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.UnlinkProcessID(p.pid, target)
+		return gen.ErrProcessTerminated
+	}
+
 	return nil
 }
 
 func (p *process) UnlinkProcessID(target gen.ProcessID) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) == false {
+	if p.node.targets.HasLink(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
@@ -1278,7 +1494,7 @@ func (p *process) UnlinkProcessID(target gen.ProcessID) error {
 }
 
 func (p *process) LinkAlias(target gen.Alias) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
@@ -1288,7 +1504,7 @@ func (p *process) LinkAlias(target gen.Alias) error {
 		}
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) {
+	if p.node.targets.HasLink(p.pid, target) {
 		return gen.ErrTargetExist
 	}
 
@@ -1296,15 +1512,21 @@ func (p *process) LinkAlias(target gen.Alias) error {
 		return err
 	}
 
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.UnlinkAlias(p.pid, target)
+		return gen.ErrProcessTerminated
+	}
+
 	return nil
 }
 
 func (p *process) UnlinkAlias(target gen.Alias) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) == false {
+	if p.node.targets.HasLink(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
@@ -1317,7 +1539,7 @@ func (p *process) UnlinkAlias(target gen.Alias) error {
 
 func (p *process) LinkEvent(target gen.Event) ([]gen.MessageEvent, error) {
 
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return nil, gen.ErrNotAllowed
 	}
 
@@ -1325,7 +1547,7 @@ func (p *process) LinkEvent(target gen.Event) ([]gen.MessageEvent, error) {
 		target.Node = p.node.name
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) {
+	if p.node.targets.HasLink(p.pid, target) {
 		return nil, gen.ErrTargetExist
 	}
 
@@ -1334,15 +1556,21 @@ func (p *process) LinkEvent(target gen.Event) ([]gen.MessageEvent, error) {
 		return nil, err
 	}
 
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.UnlinkEvent(p.pid, target)
+		return nil, gen.ErrProcessTerminated
+	}
+
 	return lastEventMessages, nil
 }
 
 func (p *process) UnlinkEvent(target gen.Event) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) == false {
+	if p.node.targets.HasLink(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
@@ -1354,11 +1582,11 @@ func (p *process) UnlinkEvent(target gen.Event) error {
 }
 
 func (p *process) LinkNode(target gen.Atom) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) {
+	if p.node.targets.HasLink(p.pid, target) {
 		return gen.ErrTargetExist
 	}
 
@@ -1366,21 +1594,29 @@ func (p *process) LinkNode(target gen.Atom) error {
 		return err
 	}
 
-	p.node.targetManager.AddLink(p.pid, target)
+	if err := p.node.targets.LinkNode(p.pid, target); err != nil {
+		return err
+	}
+
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.UnlinkNode(p.pid, target)
+		return gen.ErrProcessTerminated
+	}
 
 	return nil
 }
 
 func (p *process) UnlinkNode(target gen.Atom) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasLink(p.pid, target) == false {
+	if p.node.targets.HasLink(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
-	p.node.targetManager.RemoveLink(p.pid, target)
+	p.node.targets.UnlinkNode(p.pid, target)
 
 	return nil
 }
@@ -1416,11 +1652,11 @@ func (p *process) Demonitor(target any) error {
 }
 
 func (p *process) MonitorPID(target gen.PID) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) {
+	if p.node.targets.HasMonitor(p.pid, target) {
 		return gen.ErrTargetExist
 	}
 
@@ -1428,15 +1664,21 @@ func (p *process) MonitorPID(target gen.PID) error {
 		return err
 	}
 
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.DemonitorPID(p.pid, target)
+		return gen.ErrProcessTerminated
+	}
+
 	return nil
 }
 
 func (p *process) DemonitorPID(target gen.PID) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) == false {
+	if p.node.targets.HasMonitor(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
@@ -1448,11 +1690,11 @@ func (p *process) DemonitorPID(target gen.PID) error {
 }
 
 func (p *process) MonitorProcessID(target gen.ProcessID) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) {
+	if p.node.targets.HasMonitor(p.pid, target) {
 		return gen.ErrTargetExist
 	}
 
@@ -1460,15 +1702,21 @@ func (p *process) MonitorProcessID(target gen.ProcessID) error {
 		return err
 	}
 
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.DemonitorProcessID(p.pid, target)
+		return gen.ErrProcessTerminated
+	}
+
 	return nil
 }
 
 func (p *process) DemonitorProcessID(target gen.ProcessID) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) == false {
+	if p.node.targets.HasMonitor(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
@@ -1480,11 +1728,11 @@ func (p *process) DemonitorProcessID(target gen.ProcessID) error {
 }
 
 func (p *process) MonitorAlias(target gen.Alias) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) {
+	if p.node.targets.HasMonitor(p.pid, target) {
 		return gen.ErrTargetExist
 	}
 
@@ -1492,15 +1740,21 @@ func (p *process) MonitorAlias(target gen.Alias) error {
 		return err
 	}
 
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.DemonitorAlias(p.pid, target)
+		return gen.ErrProcessTerminated
+	}
+
 	return nil
 }
 
 func (p *process) DemonitorAlias(target gen.Alias) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) == false {
+	if p.node.targets.HasMonitor(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
@@ -1513,7 +1767,7 @@ func (p *process) DemonitorAlias(target gen.Alias) error {
 
 func (p *process) MonitorEvent(target gen.Event) ([]gen.MessageEvent, error) {
 
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return nil, gen.ErrNotAllowed
 	}
 
@@ -1521,7 +1775,7 @@ func (p *process) MonitorEvent(target gen.Event) ([]gen.MessageEvent, error) {
 		target.Node = p.node.name
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) {
+	if p.node.targets.HasMonitor(p.pid, target) {
 		return nil, gen.ErrTargetExist
 	}
 
@@ -1530,15 +1784,21 @@ func (p *process) MonitorEvent(target gen.Event) ([]gen.MessageEvent, error) {
 		return nil, err
 	}
 
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.DemonitorEvent(p.pid, target)
+		return nil, gen.ErrProcessTerminated
+	}
+
 	return lastEventMessages, nil
 }
 
 func (p *process) DemonitorEvent(target gen.Event) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) == false {
+	if p.node.targets.HasMonitor(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
@@ -1550,31 +1810,40 @@ func (p *process) DemonitorEvent(target gen.Event) error {
 }
 
 func (p *process) MonitorNode(target gen.Atom) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
 
-	if p.node.targetManager.HasMonitor(p.pid, target) {
+	if p.node.targets.HasMonitor(p.pid, target) {
 		return gen.ErrTargetExist
 	}
 
 	if _, err := p.Node().Network().GetNode(target); err != nil {
 		return err
 	}
-	p.node.targetManager.AddMonitor(p.pid, target)
+
+	if err := p.node.targets.MonitorNode(p.pid, target); err != nil {
+		return err
+	}
+
+	// recheck state - process could have been killed during the operation
+	if p.isStateIR() == false {
+		p.node.targets.DemonitorNode(p.pid, target)
+		return gen.ErrProcessTerminated
+	}
+
 	return nil
 }
 
 func (p *process) DemonitorNode(target gen.Atom) error {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ErrNotAllowed
 	}
-	if p.node.targetManager.HasMonitor(p.pid, target) == false {
+	if p.node.targets.HasMonitor(p.pid, target) == false {
 		return gen.ErrTargetUnknown
 	}
 
-	p.node.targetManager.RemoveMonitor(p.pid, target)
-	return nil
+	return p.node.targets.DemonitorNode(p.pid, target)
 }
 
 func (p *process) Log() gen.Log {
@@ -1582,14 +1851,14 @@ func (p *process) Log() gen.Log {
 }
 
 func (p *process) Info() (gen.ProcessInfo, error) {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.ProcessInfo{}, gen.ErrNotAllowed
 	}
 	return p.node.ProcessInfo(p.pid)
 }
 
 func (p *process) MetaInfo(m gen.Alias) (gen.MetaInfo, error) {
-	if p.isStateRW() == false {
+	if p.isStateIR() == false {
 		return gen.MetaInfo{}, gen.ErrNotAllowed
 	}
 	return p.node.MetaInfo(m)
@@ -1637,113 +1906,7 @@ func (p *process) Forward(
 	fp.run()
 	return nil
 }
-
 // internal
-
-func (p *process) run() {
-	if atomic.CompareAndSwapInt32(
-		&p.state,
-		int32(gen.ProcessStateSleep),
-		int32(gen.ProcessStateRunning),
-	) == false {
-		// already running or terminated
-		return
-	}
-	go func() {
-		if lib.Recover() {
-			defer func() {
-				if rcv := recover(); rcv != nil {
-					pc, fn, line, _ := runtime.Caller(2)
-					p.log.Panic("process terminated - %#v at %s[%s:%d]",
-						rcv, runtime.FuncForPC(pc).Name(), fn, line)
-					old := atomic.SwapInt32(&p.state, int32(gen.ProcessStateTerminated))
-					if old == int32(gen.ProcessStateTerminated) {
-						return
-					}
-					p.node.unregisterProcess(p, gen.TerminateReasonPanic)
-					p.behavior.ProcessTerminate(gen.TerminateReasonPanic)
-				}
-			}()
-		}
-	next:
-		startTime := time.Now().UnixNano()
-		// handle mailbox
-		if err := p.behavior.ProcessRun(); err != nil {
-			p.runningTime = p.runningTime + uint64(time.Now().UnixNano()-startTime)
-			e := errors.Unwrap(err)
-			if e == nil {
-				e = err
-			}
-			if e != gen.TerminateReasonNormal && e != gen.TerminateReasonShutdown {
-				p.log.Error("process terminated abnormally - %s", err)
-			}
-
-			old := atomic.SwapInt32(&p.state, int32(gen.ProcessStateTerminated))
-			if old == int32(gen.ProcessStateTerminated) {
-				return
-			}
-
-			p.node.unregisterProcess(p, e)
-			p.behavior.ProcessTerminate(err)
-			return
-		}
-
-		// count the running time
-		p.runningTime = p.runningTime + uint64(time.Now().UnixNano()-startTime)
-
-		// change running state to sleep
-		if atomic.CompareAndSwapInt32(
-			&p.state,
-			int32(gen.ProcessStateRunning),
-			int32(gen.ProcessStateSleep),
-		) == false {
-			// process has been killed (was in zombee state)
-			old := atomic.SwapInt32(&p.state, int32(gen.ProcessStateTerminated))
-			if old == int32(gen.ProcessStateTerminated) {
-				return
-			}
-			p.node.unregisterProcess(p, gen.TerminateReasonKill)
-			p.behavior.ProcessTerminate(gen.TerminateReasonKill)
-			return
-		}
-		// check if something left in the inbox and try to handle it
-		if p.mailbox.Main.Item() == nil {
-			if p.mailbox.System.Item() == nil {
-				if p.mailbox.Urgent.Item() == nil {
-					if p.mailbox.Log.Item() == nil {
-						// inbox is emtpy
-						return
-					}
-				}
-			}
-		}
-		// we got a new messages. try to use this goroutine again
-		if atomic.CompareAndSwapInt32(
-			&p.state,
-			int32(gen.ProcessStateSleep),
-			int32(gen.ProcessStateRunning),
-		) == false {
-			// another goroutine is already running
-			return
-		}
-		goto next
-	}()
-}
-
-func (p *process) isStateIRW() bool {
-	state := atomic.LoadInt32(&p.state)
-	irw := int32(gen.ProcessStateInit) |
-		int32(gen.ProcessStateRunning) |
-		int32(gen.ProcessStateWaitResponse)
-	return (state & irw) == state
-}
-
-func (p *process) isStateRW() bool {
-	state := atomic.LoadInt32(&p.state)
-	rw := int32(gen.ProcessStateRunning) |
-		int32(gen.ProcessStateWaitResponse)
-	return (state & rw) == state
-}
 
 func (p *process) isAlive() bool {
 	state := atomic.LoadInt32(&p.state)
@@ -1754,19 +1917,34 @@ func (p *process) isAlive() bool {
 	return (state & alive) == state
 }
 
-func (p *process) isStateSRW() bool {
+// isStateIR - Init or Running
+// Used for: Property setters, Spawn*, SendAfter, SendExitAfter
+func (p *process) isStateIR() bool {
 	state := atomic.LoadInt32(&p.state)
-	alive := int32(gen.ProcessStateSleep) |
+	mask := int32(gen.ProcessStateInit) |
+		int32(gen.ProcessStateRunning)
+	return (state & mask) == state
+}
+
+// isStateIRT - Init, Running, or Terminated
+// Used for: Send*, SendExit, SendExitMeta
+func (p *process) isStateIRT() bool {
+	state := atomic.LoadInt32(&p.state)
+	mask := int32(gen.ProcessStateInit) |
 		int32(gen.ProcessStateRunning) |
-		int32(gen.ProcessStateWaitResponse)
-	return (state & alive) == state
+		int32(gen.ProcessStateTerminated)
+	return (state & mask) == state
 }
 
 func (p *process) waitResponse(ref gen.Ref, timeout int) (any, error) {
 	var response any
 	var err error
 
-	if swapped := atomic.CompareAndSwapInt32(&p.state, int32(gen.ProcessStateRunning), int32(gen.ProcessStateWaitResponse)); swapped == false {
+	// swap to wait response state
+	prevState := atomic.SwapInt32(&p.state, int32(gen.ProcessStateWaitResponse))
+	if prevState != int32(gen.ProcessStateRunning) && prevState != int32(gen.ProcessStateInit) {
+		// not allowed, restore previous state
+		atomic.StoreInt32(&p.state, prevState)
 		return nil, gen.ErrNotAllowed
 	}
 
@@ -1798,9 +1976,17 @@ retry:
 		}
 		response = r.message
 		err = r.err
+		if r.important {
+			// send ack for important response
+			options := gen.MessageOptions{
+				Ref: r.ref,
+			}
+			p.node.RouteSendResponseError(p.pid, r.from, options, err)
+		}
 	}
 
-	if swapped := atomic.CompareAndSwapInt32(&p.state, int32(gen.ProcessStateWaitResponse), int32(gen.ProcessStateRunning)); swapped == false {
+	// restore to previous state (init or running)
+	if swapped := atomic.CompareAndSwapInt32(&p.state, int32(gen.ProcessStateWaitResponse), prevState); swapped == false {
 		return nil, gen.ErrProcessTerminated
 	}
 	return response, err

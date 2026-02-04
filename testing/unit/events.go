@@ -99,12 +99,14 @@ func (e SpawnMetaEvent) String() string {
 
 // CallEvent captures a Call operation
 type CallEvent struct {
-	From     gen.PID
-	To       any
-	Request  any
-	Response any
-	Error    error
-	Timeout  int
+	From      gen.PID
+	To        any
+	Request   any
+	Response  any
+	Error     error
+	Timeout   int
+	Priority  gen.MessagePriority
+	Important bool
 }
 
 func (e CallEvent) Type() string {
@@ -113,6 +115,40 @@ func (e CallEvent) Type() string {
 
 func (e CallEvent) String() string {
 	return "Call"
+}
+
+// InspectEvent captures an Inspect operation
+type InspectEvent struct {
+	From   gen.PID
+	Target gen.PID
+	Items  []string
+	Result map[string]string
+	Error  error
+}
+
+func (e InspectEvent) Type() string {
+	return "inspect"
+}
+
+func (e InspectEvent) String() string {
+	return "Inspect"
+}
+
+// InspectMetaEvent captures an InspectMeta operation
+type InspectMetaEvent struct {
+	From   gen.PID
+	Target gen.Alias
+	Items  []string
+	Result map[string]string
+	Error  error
+}
+
+func (e InspectMetaEvent) Type() string {
+	return "inspect_meta"
+}
+
+func (e InspectMetaEvent) String() string {
+	return "InspectMeta"
 }
 
 // LogEvent captures a Log operation
@@ -134,6 +170,7 @@ func (e LogEvent) String() string {
 type ExitEvent struct {
 	To     gen.PID
 	Reason error
+	After  time.Duration // for SendExitAfter
 }
 
 func (e ExitEvent) Type() string {
@@ -148,6 +185,7 @@ func (e ExitEvent) String() string {
 type ExitMetaEvent struct {
 	Meta   gen.Alias
 	Reason error
+	After  time.Duration // for SendExitMetaAfter
 }
 
 func (e ExitMetaEvent) Type() string {

@@ -7,11 +7,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Buffer pool for reusing strings.Builder instances
 var builderPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &strings.Builder{}
 	},
 }
@@ -28,25 +29,61 @@ var escapedLevels = map[LogLevel]string{
 	LogLevelSystem:   `"system"`,
 }
 
-// DefaultLoggerOptions
+// DefaultLoggerOptions configures the built-in default logger.
+// Part of LogOptions. The default logger is automatically enabled unless disabled.
+//
+// Output format:
+// - Plain text (default): "timestamp [level] source: message"
+// - JSON (EnableJSON): structured JSON with timestamp, level, source, message, fields
+//
+// Default logger writes to os.Stdout.
+// For file logging with rotation, use ergo.services/logger/rotate
+// For colorized terminal output, use ergo.services/logger/colored
 type DefaultLoggerOptions struct {
-	// Disable makes node to disable default logger
+	// Disable turns off the default logger completely.
+	// Use when you only want custom loggers (e.g., colored or rotate).
+	// Prevents duplicate output when using console-based custom loggers.
 	Disable bool
-	// TimeFormat enables output time in the defined format. See https://pkg.go.dev/time#pkg-constants
-	// Not defined format makes output time as a timestamp in nanoseconds.
+
+	// TimeFormat specifies the time format for log messages.
+	// Uses Go time format constants (e.g., time.RFC3339, "2006-01-02 15:04:05").
+	// See https://pkg.go.dev/time#pkg-constants
+	// If empty, outputs timestamp as nanoseconds since epoch.
 	TimeFormat string
-	// IncludeBehavior includes process/meta behavior to the log message
+
+	// IncludeBehavior adds process/meta behavior type name to log messages.
+	// Example: <PID.0.1234>[MyActor] instead of just <PID.0.1234>
+	// Useful for debugging which actor types are logging.
 	IncludeBehavior bool
-	// IncludeName includes registered process name to the log message
+
+	// IncludeName adds registered process name to log messages.
+	// Example: <PID.0.1234>[my_worker] instead of just <PID.0.1234>
+	// Only applies if process has a registered name.
 	IncludeName bool
-	// IncludeFields includes associated fields to the log message
+
+	// IncludeFields adds structured fields to log output.
+	// Shows fields added via log.AddFields() in the message.
+	// JSON format: includes as separate JSON fields
+	// Plain text: appends as key=value pairs
 	IncludeFields bool
-	// Filter enables filtering log messages.
+
+	// Filter restricts which log levels are output by default logger.
+	// Empty means log all levels.
+	// Example: []LogLevel{LogLevelError, LogLevelPanic} - only errors and panics
 	Filter []LogLevel
-	// Output defines output for the log messages. By default it uses os.Stdout
+
+	// Output specifies where to write log messages.
+	// Default: os.Stdout (console output)
+	// Can be any io.Writer (file, buffer, network connection, etc.)
 	Output io.Writer
-	// EnableJSON enables JSON output format
+
+	// EnableJSON switches output format to JSON.
+	// Each log message is a single-line JSON object with structured data.
+	// Useful for log aggregation tools (Elasticsearch, Splunk, etc.)
 	EnableJSON bool
+
+	// DisableBanner disables Ergo logo on start
+	DisableBanner bool
 }
 
 //
@@ -67,6 +104,21 @@ func CreateDefaultLogger(options DefaultLoggerOptions) LoggerBehavior {
 	l.includeName = options.IncludeName
 	l.includeFields = options.IncludeFields
 	l.enableJSON = options.EnableJSON
+
+	if options.DisableBanner {
+		return &l
+	}
+
+	var t string
+	if l.format == "" {
+		t = fmt.Sprintf("%d", time.Now().UnixNano())
+	} else {
+		t = time.Now().Format(l.format)
+	}
+
+	for _, bl := range banner {
+		fmt.Printf("%s %s\n", t, bl)
+	}
 
 	return &l
 }
@@ -378,7 +430,7 @@ func (l *defaultLogger) writeSourceDirect(buf *strings.Builder, source any) {
 	case MessageLogMeta:
 		buf.WriteString(src.Meta.String())
 	default:
-		buf.WriteString(fmt.Sprintf("%#v", source))
+		fmt.Fprintf(buf, "%#v", source)
 	}
 }
 
@@ -417,8 +469,22 @@ func (l *defaultLogger) writeFieldValuePlainText(buf *strings.Builder, value any
 		}
 	default:
 		// Fallback to string representation for unknown types
-		buf.WriteString(fmt.Sprintf("%v", v))
+		fmt.Fprintf(buf, "%v", v)
 	}
 }
 
 func (l *defaultLogger) Terminate() {}
+
+var banner = []string{
+	`     ███▓▓▓▓▓▓███ `,
+	`   ██▓▓▓▓▒▒▒▒▓▓▓▓██    ▓▓▓██▓`,
+	`  █▓▓▒▒▒▒▓▓▓▓▒▒▒▒▓▓█   ██▓▒▒▒ ▒▒░ ▒▓▒ ░▒▒ ▒▓  ▒▓▒`,
+	` █▓▒▒▒▒▒▒▒██▒▒▒▒▒▒▒▓█  ██▒░░  ▓█▓▒█▓█▒▓█▓█░▓▒▒█▓█▒`,
+	` █▒▒▒▒▓██▒▓▓▒██▓▒▒▒▒█  ████▓   ▓██▓ ▓██▓ ██ ▒█▓ ██▒`,
+	` ▓▒▒██▒▓▓▒██▒▓▓▒██▒▒▓  ██░     ▓█▓   ▓█▓ ██ ▒█▓ ██░`,
+	` █▒▒▓▓▒▓▓▒▓▓▒▓▓▒▓▓▒▒█  ██░░██  ▓█▓   ▓█▓ ██ ▒█▓ ██▒`,
+	` █▓▒▒▒▒██▒▒▒▒██▒▒▒▒▓█  ██████ ▓███▓  ░▓█▓██░ ▓█▓█▒`,
+	`  █▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓█   ▒▒▓▓▒▒ ▒▒▒▒▒   ░▒▓██░  ▒▓▒`,
+	`   █▓▓▒▒▒▒▒▒▒▒▒▒▓▓█                   ░ ░█▓`,
+	`     ██▓▓▓▒▒▓▓▓██                    ▓████`,
+}

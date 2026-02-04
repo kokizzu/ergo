@@ -18,12 +18,45 @@ import (
 	"ergo.services/ergo/lib"
 	"ergo.services/ergo/lib/osdep"
 	"ergo.services/ergo/net/edf"
+	"ergo.services/ergo/node/tm"
 )
 
 var (
 	startID     = uint64(1000)
 	startUniqID = uint64(time.Now().UnixNano())
+
+	nodeCallPool = sync.Pool{
+		New: func() any {
+			return &nodeCall{
+				done: make(chan struct{}, 1),
+			}
+		},
+	}
 )
+
+type nodeCall struct {
+	done      chan struct{} // semaphore to signal call is done
+	response  any
+	err       error
+	from      gen.PID
+	important bool
+}
+
+func takeNodeCall() *nodeCall {
+	return nodeCallPool.Get().(*nodeCall)
+}
+
+func releaseNodeCall(r *nodeCall) {
+	// Drain channel before returning to pool (safety)
+	select {
+	case <-r.done:
+	default:
+	}
+	r.response, r.err = nil, nil
+	r.important = false
+	r.from = gen.PID{}
+	nodeCallPool.Put(r)
+}
 
 type node struct {
 	name      gen.Atom
@@ -44,12 +77,12 @@ type node struct {
 	processes sync.Map // process pid gen.PID -> *process
 	names     sync.Map // process name gen.Atom -> *process
 	aliases   sync.Map // process alias gen.Alias -> *process
-	events    sync.Map // process event gen.Event -> *eventOwner
+	calls     sync.Map // node-level call responses gen.Ref -> *nodeCall
 
 	applications sync.Map // application name -> *application
 
-	// consumer lists (subcribers)
-	targetManager gen.TargetManager
+	// consumer lists (subscribers)
+	targets gen.TargetManager
 
 	network *network
 
@@ -58,9 +91,10 @@ type node struct {
 	loggers map[gen.LogLevel]*sync.Map // level -> name -> gen.LoggerBehavior
 	log     *log
 
-	waitprocesses sync.WaitGroup
-	wait          chan struct{}
-	once          sync.Once
+	shutdownTimeout time.Duration
+	waitprocesses   sync.WaitGroup
+	wait            chan struct{}
+	once            sync.Once
 
 	licenses sync.Map
 
@@ -78,13 +112,6 @@ type eventOwner struct {
 	consumers int32
 
 	last lib.QueueMPSC
-}
-
-func createTargetManager(tm gen.TargetManager) gen.TargetManager {
-	if tm != nil {
-		return tm
-	}
-	return gen.CreateDefaultTargetManager()
 }
 
 func Start(name gen.Atom, options gen.NodeOptions, frameworkVersion gen.Version) (gen.Node, error) {
@@ -105,6 +132,10 @@ func Start(name gen.Atom, options gen.NodeOptions, frameworkVersion gen.Version)
 
 	creation := time.Now().Unix()
 
+	if options.ShutdownTimeout <= 0 {
+		options.ShutdownTimeout = gen.DefaultShutdownTimeout
+	}
+
 	node := &node{
 		name:      name,
 		version:   options.Version,
@@ -118,7 +149,7 @@ func Start(name gen.Atom, options gen.NodeOptions, frameworkVersion gen.Version)
 		certmanager: options.CertManager,
 		security:    options.Security,
 
-		targetManager: createTargetManager(options.TargetManager),
+		shutdownTimeout: options.ShutdownTimeout,
 
 		loggers: make(map[gen.LogLevel]*sync.Map),
 
@@ -160,13 +191,26 @@ func Start(name gen.Atom, options gen.NodeOptions, frameworkVersion gen.Version)
 		node.LoggerAdd(lo.Name, lo.Logger, lo.Filter...)
 	}
 
-	node.coreEventsToken, _ = node.RegisterEvent(gen.CoreEvent, gen.EventOptions{})
-
 	node.validateLicenses(node.version)
+
+	// create target manager (pub/sub subsystem) before network start
+	// because registrar may call RegisterEvent during network initialization
+	node.targets = tm.Create(createTMBridge(node), tm.Options{})
+
 	node.network = createNetwork(node)
 
 	if err := node.NetworkStart(options.Network); err != nil {
 		return nil, err
+	}
+
+	node.coreEventsToken, _ = node.RegisterEvent(gen.CoreEvent, gen.EventOptions{})
+
+	node.cron = createCron(node)
+	for _, job := range options.Cron.Jobs {
+		if err := node.cron.AddJob(job); err != nil {
+			node.StopForce()
+			return nil, err
+		}
 	}
 
 	if len(options.Applications) > 0 {
@@ -190,13 +234,6 @@ func Start(name gen.Atom, options gen.NodeOptions, frameworkVersion gen.Version)
 
 	edf.RegisterAtom(name)
 	node.log.Info("node %s built with %q successfully started", node.name, node.framework)
-	node.cron = createCron(node)
-	for _, job := range options.Cron.Jobs {
-		if err := node.cron.AddJob(job); err != nil {
-			node.StopForce()
-			return nil, err
-		}
-	}
 
 	// enable SIGTERM
 	node.SetCTRLC(true)
@@ -241,9 +278,6 @@ func (n *node) Commercial() []gen.Version {
 }
 
 func (n *node) EnvList() map[gen.Env]any {
-	if n.isRunning() == false {
-		return nil
-	}
 	env := make(map[gen.Env]any)
 	n.env.Range(func(k, v any) bool {
 		env[gen.Env(k.(string))] = v
@@ -264,18 +298,10 @@ func (n *node) SetEnv(name gen.Env, value any) {
 }
 
 func (n *node) Env(name gen.Env) (any, bool) {
-	if n.isRunning() == false {
-		return nil, false
-	}
-
 	return n.env.Load(name.String())
 }
 
 func (n *node) EnvDefault(name gen.Env, def any) any {
-	if n.isRunning() == false {
-		return def
-	}
-
 	value, ok := n.env.Load(name.String())
 	if ok == false {
 		return def
@@ -299,6 +325,18 @@ func (n *node) Spawn(
 	if n.isRunning() == false {
 		return gen.PID{}, gen.ErrNodeTerminated
 	}
+
+	// calculate deadline
+	timeout := options.InitTimeout
+	if timeout == 0 {
+		timeout = gen.DefaultRequestTimeout
+	}
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := n.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return gen.PID{}, err
+	}
+
 	opts := gen.ProcessOptionsExtra{
 		ProcessOptions: options,
 		Args:           args,
@@ -306,23 +344,32 @@ func (n *node) Spawn(
 		ParentLeader:   n.corePID,
 		ParentLogLevel: n.log.level,
 		ParentEnv:      n.EnvList(),
+		Ref:            ref,
 	}
 
 	return n.spawn(factory, opts)
 }
 
-func (n *node) SpawnRegister(
-	register gen.Atom,
-	factory gen.ProcessFactory,
-	options gen.ProcessOptions,
-	args ...any,
-) (gen.PID, error) {
+func (n *node) SpawnRegister(register gen.Atom, factory gen.ProcessFactory,
+	options gen.ProcessOptions, args ...any) (gen.PID, error) {
 	if n.isRunning() == false {
 		return gen.PID{}, gen.ErrNodeTerminated
 	}
 	if len(register) > 255 {
 		return gen.PID{}, gen.ErrAtomTooLong
 	}
+
+	// calculate deadline
+	timeout := options.InitTimeout
+	if timeout == 0 {
+		timeout = gen.DefaultRequestTimeout
+	}
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := n.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return gen.PID{}, err
+	}
+
 	opts := gen.ProcessOptionsExtra{
 		ProcessOptions: options,
 		Register:       register,
@@ -331,9 +378,9 @@ func (n *node) SpawnRegister(
 		ParentLeader:   n.corePID,
 		ParentLogLevel: n.log.level,
 		ParentEnv:      n.EnvList(),
+		Ref:            ref,
 	}
 	return n.spawn(factory, opts)
-
 }
 
 func (n *node) RegisterName(name gen.Atom, pid gen.PID) error {
@@ -489,8 +536,9 @@ func (n *node) ProcessInfo(pid gen.PID) (gen.ProcessInfo, error) {
 		return true
 	})
 
-	// Get links and monitors from TargetManager
-	linkTargets, monitorTargets := n.targetManager.GetTargetsForConsumer(pid)
+	// Get links and monitors from separate managers
+	linkTargets := n.targets.LinksFor(pid)
+	monitorTargets := n.targets.MonitorsFor(pid)
 
 	for _, target := range linkTargets {
 		switch m := target.(type) {
@@ -656,10 +704,6 @@ func (n *node) Info() (gen.NodeInfo, error) {
 	})
 	n.aliases.Range(func(_, _ any) bool {
 		info.RegisteredAliases++
-		return true
-	})
-	n.events.Range(func(_, _ any) bool {
-		info.RegisteredEvents++
 		return true
 	})
 
@@ -830,7 +874,53 @@ func (n *node) stop(force bool) {
 	}
 
 	if force == false {
+		// start a goroutine to print pending processes every 5 seconds
+		// and force exit if shutdown timeout expires
+		stopPrinting := make(chan struct{})
+		shutdownTimeout := n.shutdownTimeout
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			timeout := time.After(shutdownTimeout)
+			for {
+				select {
+				case <-stopPrinting:
+					return
+				case <-timeout:
+					n.log.Error("shutdown timeout %s expired, force exit", n.shutdownTimeout)
+					os.Exit(1)
+				case <-ticker.C:
+					var count int
+					n.processes.Range(func(_, v any) bool {
+						count++
+						if count > 10 {
+							return true
+						}
+						if count == 1 {
+							n.log.Warning("node %s is still waiting for process(es) to terminate:", n.name)
+						}
+
+						p := v.(*process)
+						name := p.sbehavior
+						state := gen.ProcessState(atomic.LoadInt32(&p.state))
+						qlen := p.mailbox.Len()
+
+						if p.name != "" {
+							name = fmt.Sprintf("%s, %s", p.name, p.sbehavior)
+						}
+
+						n.log.Warning("  %s (%s) state: %s, queue: %d",
+							p.pid, name, state, qlen)
+						return true
+					})
+					if count > 10 {
+						n.log.Warning("  ...and %d more", count-10)
+					}
+				}
+			}
+		}()
 		n.waitprocesses.Wait()
+		close(stopPrinting)
 	}
 
 	n.NetworkStop()
@@ -901,12 +991,7 @@ func (n *node) SendWithPriority(to any, message any, priority gen.MessagePriorit
 	return gen.ErrUnsupported
 }
 
-func (n *node) SendEvent(
-	name gen.Atom,
-	token gen.Ref,
-	options gen.MessageOptions,
-	message any,
-) error {
+func (n *node) SendEvent(name gen.Atom, token gen.Ref, options gen.MessageOptions, message any) error {
 	if n.isRunning() == false {
 		return gen.ErrNodeTerminated
 	}
@@ -949,6 +1034,426 @@ func (n *node) SendExit(pid gen.PID, reason error) error {
 	return n.RouteSendExit(n.corePID, pid, reason)
 }
 
+func (n *node) Call(to any, request any) (any, error) {
+	options := gen.MessageOptions{
+		Priority: gen.MessagePriorityNormal,
+	}
+	return n.callWithOptions(to, request, gen.DefaultRequestTimeout, options)
+}
+
+func (n *node) CallWithTimeout(to any, request any, timeout int) (any, error) {
+	options := gen.MessageOptions{
+		Priority: gen.MessagePriorityNormal,
+	}
+	return n.callWithOptions(to, request, timeout, options)
+}
+
+func (n *node) CallWithPriority(to any, request any, priority gen.MessagePriority) (any, error) {
+	options := gen.MessageOptions{
+		Priority: priority,
+	}
+	return n.callWithOptions(to, request, gen.DefaultRequestTimeout, options)
+}
+
+func (n *node) CallImportant(to any, request any) (any, error) {
+	options := gen.MessageOptions{
+		Priority:          gen.MessagePriorityNormal,
+		ImportantDelivery: true,
+	}
+	return n.callWithOptions(to, request, gen.DefaultRequestTimeout, options)
+}
+
+func (n *node) callWithOptions(to any, request any, timeout int, options gen.MessageOptions) (any, error) {
+	if n.isRunning() == false {
+		return nil, gen.ErrNodeTerminated
+	}
+
+	switch t := to.(type) {
+	case gen.Atom:
+		return n.callProcessIDWithOptions(gen.ProcessID{Name: t, Node: n.name}, request, timeout, options)
+	case gen.PID:
+		return n.callPIDWithOptions(t, request, timeout, options)
+	case gen.ProcessID:
+		return n.callProcessIDWithOptions(t, request, timeout, options)
+	case gen.Alias:
+		return n.callAliasWithOptions(t, request, timeout, options)
+	}
+
+	return nil, gen.ErrUnsupported
+}
+
+func (n *node) CallPID(to gen.PID, request any, timeout int) (any, error) {
+	options := gen.MessageOptions{
+		Priority: gen.MessagePriorityNormal,
+	}
+	return n.callPIDWithOptions(to, request, timeout, options)
+}
+
+func (n *node) callPIDWithOptions(
+	to gen.PID,
+	request any,
+	timeout int,
+	options gen.MessageOptions,
+) (any, error) {
+	if n.isRunning() == false {
+		return nil, gen.ErrNodeTerminated
+	}
+
+	if timeout < 1 {
+		timeout = gen.DefaultRequestTimeout
+	}
+
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := n.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return nil, err
+	}
+
+	call := takeNodeCall()
+	n.calls.Store(ref, call)
+	defer n.calls.Delete(ref)
+
+	options.Ref = ref
+
+	if err = n.RouteCallPID(n.corePID, to, options, request); err != nil {
+		releaseNodeCall(call)
+		return nil, err
+	}
+
+	timer := lib.TakeTimer()
+	defer lib.ReleaseTimer(timer)
+	timer.Reset(time.Duration(timeout) * time.Second)
+
+	select {
+	case <-call.done:
+		goto handleResponse
+	case <-timer.C:
+		// Check if response arrived at the same moment as timeout
+		select {
+		case <-call.done:
+			goto handleResponse
+		default:
+			// No response yet - don't return to pool as late response might arrive
+			return nil, gen.ErrTimeout
+		}
+	}
+
+handleResponse:
+	response := call.response
+	err = call.err
+	releaseNodeCall(call)
+
+	if call.important {
+		options := gen.MessageOptions{
+			Ref: ref,
+		}
+
+		// send ack
+		n.RouteSendResponseError(n.corePID, call.from, options, nil)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (n *node) CallProcessID(to gen.ProcessID, request any, timeout int) (any, error) {
+	options := gen.MessageOptions{
+		Priority: gen.MessagePriorityNormal,
+	}
+	return n.callProcessIDWithOptions(to, request, timeout, options)
+}
+
+func (n *node) callProcessIDWithOptions(
+	to gen.ProcessID,
+	request any,
+	timeout int,
+	options gen.MessageOptions,
+) (any, error) {
+	if n.isRunning() == false {
+		return nil, gen.ErrNodeTerminated
+	}
+
+	if timeout < 1 {
+		timeout = gen.DefaultRequestTimeout
+	}
+
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := n.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return nil, err
+	}
+
+	call := takeNodeCall()
+	n.calls.Store(ref, call)
+	defer n.calls.Delete(ref)
+
+	options.Ref = ref
+
+	if err = n.RouteCallProcessID(n.corePID, to, options, request); err != nil {
+		releaseNodeCall(call)
+		return nil, err
+	}
+
+	timer := lib.TakeTimer()
+	defer lib.ReleaseTimer(timer)
+	timer.Reset(time.Duration(timeout) * time.Second)
+
+	select {
+	case <-call.done:
+		goto handleResponse
+	case <-timer.C:
+		// Check if response arrived at the same moment as timeout
+		select {
+		case <-call.done:
+			goto handleResponse
+		default:
+			// No response yet - don't return to pool as late response might arrive
+			return nil, gen.ErrTimeout
+		}
+	}
+
+handleResponse:
+	response := call.response
+	err = call.err
+	releaseNodeCall(call)
+
+	if call.important {
+		options := gen.MessageOptions{
+			Ref: ref,
+		}
+		// send ack
+		n.RouteSendResponseError(n.corePID, call.from, options, nil)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (n *node) CallAlias(to gen.Alias, request any, timeout int) (any, error) {
+	options := gen.MessageOptions{
+		Priority: gen.MessagePriorityNormal,
+	}
+	return n.callAliasWithOptions(to, request, timeout, options)
+}
+
+func (n *node) callAliasWithOptions(
+	to gen.Alias,
+	request any,
+	timeout int,
+	options gen.MessageOptions,
+) (any, error) {
+	if n.isRunning() == false {
+		return nil, gen.ErrNodeTerminated
+	}
+
+	if timeout < 1 {
+		timeout = gen.DefaultRequestTimeout
+	}
+
+	deadline := time.Now().Unix() + int64(timeout)
+	ref, err := n.MakeRefWithDeadline(deadline)
+	if err != nil {
+		return nil, err
+	}
+
+	call := takeNodeCall()
+	n.calls.Store(ref, call)
+	defer n.calls.Delete(ref)
+
+	options.Ref = ref
+
+	if err = n.RouteCallAlias(n.corePID, to, options, request); err != nil {
+		releaseNodeCall(call)
+		return nil, err
+	}
+
+	timer := lib.TakeTimer()
+	defer lib.ReleaseTimer(timer)
+	timer.Reset(time.Duration(timeout) * time.Second)
+
+	select {
+	case <-call.done:
+		goto handleResponse
+	case <-timer.C:
+		// Check if response arrived at the same moment as timeout
+		select {
+		case <-call.done:
+			goto handleResponse
+		default:
+			// No response yet - don't return to pool as late response might arrive
+			return nil, gen.ErrTimeout
+		}
+	}
+
+handleResponse:
+	response := call.response
+	err = call.err
+	releaseNodeCall(call)
+
+	if call.important {
+		options := gen.MessageOptions{
+			Ref: ref,
+		}
+		// send ack
+		n.RouteSendResponseError(n.corePID, call.from, options, nil)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (n *node) Inspect(target gen.PID, item ...string) (map[string]string, error) {
+	if n.isRunning() == false {
+		return nil, gen.ErrNodeTerminated
+	}
+
+	if target.Node != n.name {
+		// inspecting remote process is not allowed
+		return nil, gen.ErrNotAllowed
+	}
+
+	ref := n.MakeRef()
+
+	value, found := n.processes.Load(target)
+	if found == false {
+		return nil, gen.ErrProcessUnknown
+	}
+	targetp := value.(*process)
+
+	if alive := targetp.isAlive(); alive == false {
+		return nil, gen.ErrProcessTerminated
+	}
+
+	call := takeNodeCall()
+	n.calls.Store(ref, call)
+	defer n.calls.Delete(ref)
+
+	qm := gen.TakeMailboxMessage()
+	qm.Ref = ref
+	qm.From = n.corePID
+	qm.Type = gen.MailboxMessageTypeInspect
+	qm.Message = item
+
+	if ok := targetp.mailbox.Urgent.Push(qm); ok == false {
+		releaseNodeCall(call)
+		return nil, gen.ErrProcessMailboxFull
+	}
+
+	targetp.run()
+
+	timer := lib.TakeTimer()
+	defer lib.ReleaseTimer(timer)
+	timer.Reset(time.Duration(gen.DefaultRequestTimeout) * time.Second)
+
+	select {
+	case <-call.done:
+		response := call.response
+		err := call.err
+		releaseNodeCall(call)
+		if err != nil {
+			return nil, err
+		}
+		return response.(map[string]string), nil
+	case <-timer.C:
+		// Check if response arrived at the same moment as timeout
+		select {
+		case <-call.done:
+			response := call.response
+			err := call.err
+			releaseNodeCall(call)
+			if err != nil {
+				return nil, err
+			}
+			return response.(map[string]string), nil
+		default:
+			// Don't release call - late response might arrive
+			return nil, gen.ErrTimeout
+		}
+	}
+}
+
+func (n *node) InspectMeta(alias gen.Alias, item ...string) (map[string]string, error) {
+	if n.isRunning() == false {
+		return nil, gen.ErrNodeTerminated
+	}
+
+	if alias.Node != n.name {
+		// inspecting remote meta process is not allowed
+		return nil, gen.ErrNotAllowed
+	}
+
+	value, found := n.aliases.Load(alias)
+	if found == false {
+		return nil, gen.ErrMetaUnknown
+	}
+
+	metap := value.(*process)
+	if alive := metap.isAlive(); alive == false {
+		return nil, gen.ErrProcessTerminated
+	}
+
+	value, found = metap.metas.Load(alias)
+	if found == false {
+		return nil, gen.ErrMetaUnknown
+	}
+
+	m := value.(*meta)
+	ref := n.MakeRef()
+
+	call := takeNodeCall()
+	n.calls.Store(ref, call)
+	defer n.calls.Delete(ref)
+
+	qm := gen.TakeMailboxMessage()
+	qm.Ref = ref
+	qm.From = n.corePID
+	qm.Type = gen.MailboxMessageTypeInspect
+	qm.Message = item
+
+	if ok := m.system.Push(qm); ok == false {
+		releaseNodeCall(call)
+		return nil, gen.ErrProcessMailboxFull
+	}
+
+	m.handle()
+
+	timer := lib.TakeTimer()
+	defer lib.ReleaseTimer(timer)
+	timer.Reset(time.Duration(gen.DefaultRequestTimeout) * time.Second)
+
+	select {
+	case <-call.done:
+		response := call.response
+		err := call.err
+		releaseNodeCall(call)
+		if err != nil {
+			return nil, err
+		}
+		return response.(map[string]string), nil
+	case <-timer.C:
+		// Check if response arrived at the same moment as timeout
+		select {
+		case <-call.done:
+			response := call.response
+			err := call.err
+			releaseNodeCall(call)
+			if err != nil {
+				return nil, err
+			}
+			return response.(map[string]string), nil
+		default:
+			// Don't release call - late response might arrive
+			return nil, gen.ErrTimeout
+		}
+	}
+}
+
 func (n *node) Kill(pid gen.PID) error {
 	if n.isRunning() == false {
 		return gen.ErrNodeTerminated
@@ -962,7 +1467,9 @@ func (n *node) Kill(pid gen.PID) error {
 	p := value.(*process)
 	state := atomic.SwapInt32(&p.state, int32(gen.ProcessStateZombee))
 	switch state {
-	case int32(gen.ProcessStateWaitResponse), int32(gen.ProcessStateRunning):
+	case int32(gen.ProcessStateInit),
+		int32(gen.ProcessStateWaitResponse),
+		int32(gen.ProcessStateRunning):
 		// do not unregister process until its goroutine stopped
 		return nil
 	case int32(gen.ProcessStateTerminated):
@@ -991,6 +1498,30 @@ func (n *node) Kill(pid gen.PID) error {
 	}()
 
 	return nil
+}
+
+func (n *node) ProcessName(pid gen.PID) (gen.Atom, error) {
+	if n.isRunning() == false {
+		return "", gen.ErrNodeTerminated
+	}
+	value, loaded := n.processes.Load(pid)
+	if loaded == false {
+		return "", gen.ErrProcessUnknown
+	}
+	p := value.(*process)
+	return p.Name(), nil
+}
+
+func (n *node) ProcessPID(name gen.Atom) (gen.PID, error) {
+	if n.isRunning() == false {
+		return gen.PID{}, gen.ErrNodeTerminated
+	}
+	value, loaded := n.names.Load(name)
+	if loaded == false {
+		return gen.PID{}, gen.ErrProcessUnknown
+	}
+	p := value.(*process)
+	return p.pid, nil
 }
 
 func (n *node) ProcessState(pid gen.PID) (gen.ProcessState, error) {
@@ -1447,9 +1978,6 @@ func (n *node) LoggerAdd(name string, logger gen.LoggerBehavior, filter ...gen.L
 }
 
 func (n *node) LoggerDeletePID(pid gen.PID) {
-	if n.isRunning() == false {
-		return
-	}
 	value, loaded := n.processes.Load(pid)
 	if loaded == false {
 		return
@@ -1471,10 +1999,6 @@ func (n *node) LoggerDeletePID(pid gen.PID) {
 
 func (n *node) LoggerDelete(name string) {
 	var logger gen.LoggerBehavior
-
-	if n.isRunning() == false {
-		return
-	}
 
 	for _, l := range n.loggers {
 		if v, exist := l.LoadAndDelete(name); exist {
@@ -1519,15 +2043,17 @@ func (n *node) dolog(message gen.MessageLog, loggername string) {
 		return
 	}
 	if l := n.loggers[message.Level]; l != nil {
-		l.Range(func(k, v any) bool {
-			if loggername == "" {
-				logger := v.(gen.LoggerBehavior)
-				logger.Log(message)
-				return true
+		if loggername != "" {
+			if v, found := l.Load(loggername); found {
+				v.(gen.LoggerBehavior).Log(message)
 			}
-			if loggername == k.(string) {
-				logger := v.(gen.LoggerBehavior)
-				logger.Log(message)
+			return
+		}
+
+		l.Range(func(k, v any) bool {
+			logger := k.(string)
+			if logger[0] != '.' {
+				v.(gen.LoggerBehavior).Log(message)
 			}
 			return true
 		})
@@ -1690,49 +2216,99 @@ func (n *node) spawn(factory gen.ProcessFactory, options gen.ProcessOptionsExtra
 	}
 	p.log.setSource(logSource)
 
-	if err := behavior.ProcessInit(p, options.Args...); err != nil {
-		n.names.Delete(p.name)
-		// make sure to notify children that might have been spawned
-		// (during ProcessInit callback) with the enabled LinkParent option
-		messageExit := gen.MessageExitPID{
-			PID:    p.pid,
-			Reason: err,
-		}
-		linkTargets, _ := n.targetManager.CleanupConsumer(p.pid)
-		for _, target := range linkTargets {
-			if pid, ok := target.(gen.PID); ok {
-				n.sendExitMessage(p.pid, pid, messageExit)
+	// early registration - allows using Link/Monitor/RegisterEvent/RegisterName in Init
+	n.processes.Store(p.pid, p)
+
+	// Handle ProcessInit with timeout
+	var initErr error
+	deadline := options.Ref.ID[2]
+
+	if deadline > 0 {
+		// check if already expired
+		if options.Ref.IsAlive() == false {
+			n.processes.Delete(p.pid)
+			if p.registered.Load() {
+				n.names.Delete(p.name)
 			}
+			return p.pid, gen.ErrTimeout
 		}
 
-		// terminate meta process that spawned during initialization
+		// calculate remaining time
+		remaining := time.Duration(int64(deadline)-time.Now().Unix()) * time.Second
 
-		p.metas.Range(func(_, v any) bool {
-			m := v.(*meta)
+		var completed int32
+		errCh := make(chan error, 1)
 
-			qm := gen.TakeMailboxMessage()
-			qm.From = p.pid
-			qm.Type = gen.MailboxMessageTypeExit
-			qm.Message = err
+		go func() {
+			err := behavior.ProcessInit(p, options.Args...)
 
-			if ok := m.system.Push(qm); ok == false {
-				p.log.Error("unable to stop meta process %s. mailbox is full", m.id)
+			// try to claim "init completed"
+			if atomic.CompareAndSwapInt32(&completed, 0, 1) {
+				// we won - main will receive result
+				errCh <- err
+				return
 			}
-			p.node.aliases.Delete(m.id)
-			go m.handle()
-			return true
-		})
 
-		return p.pid, err
+			// timeout won - main already called Kill, we do cleanup
+			atomic.StoreInt32(&p.state, int32(gen.ProcessStateTerminated))
+			n.cleanupProcess(p, gen.TerminateReasonKill)
+			if lib.Recover() {
+				defer func() {
+					if rcv := recover(); rcv != nil {
+						pc, fn, line, _ := runtime.Caller(2)
+						p.log.Panic("panic in ProcessTerminate - %s[%s] %#v at %s[%s:%d]",
+							p.pid, p.name, rcv, runtime.FuncForPC(pc).Name(), fn, line)
+					}
+				}()
+			}
+			p.behavior.ProcessTerminate(gen.TerminateReasonKill)
+		}()
+
+		timer := lib.TakeTimer()
+		timer.Reset(remaining)
+
+		select {
+		case initErr = <-errCh:
+			lib.ReleaseTimer(timer)
+		case <-timer.C:
+			lib.ReleaseTimer(timer)
+			// try to claim "timeout"
+			if atomic.CompareAndSwapInt32(&completed, 0, 2) {
+				// we won - goroutine will do cleanup when ProcessInit completes
+				n.Kill(p.pid)
+				return p.pid, gen.ErrTimeout
+			}
+			// goroutine won - receive result
+			initErr = <-errCh
+		}
+	} else {
+		// no timeout - synchronous behavior
+		initErr = behavior.ProcessInit(p, options.Args...)
+	}
+
+	if initErr != nil {
+		n.cleanupProcess(p, initErr)
+		go func() {
+			if lib.Recover() {
+				defer func() {
+					if rcv := recover(); rcv != nil {
+						pc, fn, line, _ := runtime.Caller(2)
+						p.log.Panic("panic in ProcessTerminate - %s[%s] %#v at %s[%s:%d]",
+							p.pid, p.name, rcv, runtime.FuncForPC(pc).Name(), fn, line)
+					}
+				}()
+			}
+			p.behavior.ProcessTerminate(initErr)
+		}()
+		return p.pid, initErr
 	}
 
 	if options.LinkParent {
-		n.targetManager.AddLink(p.pid, p.parent)
+		n.targets.LinkPID(p.pid, p.parent)
 	}
 
-	// register process and switch it to the sleep state
+	// switch to sleep state (process already registered above)
 	p.state = int32(gen.ProcessStateSleep)
-	n.processes.Store(p.pid, p)
 
 	// do not count system app processes
 	if p.application != system.Name {
@@ -1746,15 +2322,14 @@ func (n *node) spawn(factory gen.ProcessFactory, options gen.ProcessOptionsExtra
 	return p.pid, nil
 }
 
-func (n *node) unregisterProcess(p *process, reason error) {
+// cleanupProcess performs core cleanup for a process.
+// Does NOT call waitprocesses.Done() - caller must handle if needed.
+func (n *node) cleanupProcess(p *process, reason error) {
 	n.processes.Delete(p.pid)
-	n.RouteTerminatePID(p.pid, reason)
+	n.RouteTerminatePID(p.pid, reason) // calls TerminatedTargetPID internally
+	n.targets.TerminatedProcess(p.pid, reason)
 
-	if p.application != system.Name {
-		// do not count system app processes
-		n.waitprocesses.Done()
-	}
-	n.log.Trace("...unregisterProcess %s", p.pid)
+	n.log.Trace("...cleanupProcess %s", p.pid)
 
 	if p.registered.Load() {
 		n.names.Delete(p.name)
@@ -1767,22 +2342,12 @@ func (n *node) unregisterProcess(p *process, reason error) {
 		n.RouteTerminateAlias(a, reason)
 	}
 
-	p.events.Range(func(k, _ any) bool {
-		ev := gen.Event{Name: k.(gen.Atom), Node: p.node.name}
-		n.events.Delete(ev)
-		n.RouteTerminateEvent(ev, reason)
-		return true
-	})
-
-	// send exit signal to the meta processes
 	p.metas.Range(func(_, v any) bool {
 		m := v.(*meta)
-
 		qm := gen.TakeMailboxMessage()
 		qm.From = p.pid
 		qm.Type = gen.MailboxMessageTypeExit
 		qm.Message = reason
-
 		p.node.aliases.Delete(m.id)
 		if ok := m.system.Push(qm); ok == false {
 			p.log.Error("unable to stop meta process %s. mailbox is full", m.id)
@@ -1790,22 +2355,26 @@ func (n *node) unregisterProcess(p *process, reason error) {
 		m.handle()
 		return true
 	})
+}
 
-	if p.loggername != "" { // acted as a logger
+func (n *node) unregisterProcess(p *process, reason error) {
+	n.cleanupProcess(p, reason)
+
+	if p.application != system.Name {
+		n.waitprocesses.Done()
+	}
+	n.log.Trace("...unregisterProcess %s", p.pid)
+
+	if p.loggername != "" {
 		n.LoggerDelete(p.loggername)
-		// enable logging. it might be used
-		// in the termination callback (like a act.ActorBehavior.Terminate)
 		p.log.SetLevel(gen.LogLevelInfo)
 	}
 
-	if p.application == "" {
-		return
-	}
-
-	if v, exist := n.applications.Load(p.application); exist {
-		// this process was a member of the application
-		app := v.(*application)
-		app.terminate(p.pid, reason)
+	if p.application != "" {
+		if v, exist := n.applications.Load(p.application); exist {
+			app := v.(*application)
+			app.terminate(p.pid, reason)
+		}
 	}
 }
 
@@ -1847,28 +2416,13 @@ func (n *node) registerEvent(
 	owner gen.PID,
 	options gen.EventOptions,
 ) (gen.Ref, error) {
-	token := gen.Ref{}
 	if n.isRunning() == false {
-		return token, gen.ErrNodeTerminated
+		return gen.Ref{}, gen.ErrNodeTerminated
 	}
 
 	n.log.Trace("...registerEvent %s for %s", name, owner)
-	ev := gen.Event{Name: name, Node: n.name}
-	event := &eventOwner{
-		name:     name,
-		producer: owner,
-		notify:   options.Notify,
-	}
 
-	if options.Buffer > 0 {
-		event.last = lib.NewQueueLimitMPSC(int64(options.Buffer), true)
-	}
-
-	if _, exist := n.events.LoadOrStore(ev, event); exist {
-		return token, gen.ErrTaken
-	}
-	event.token = n.MakeRef()
-	return event.token, nil
+	return n.targets.RegisterEvent(owner, name, options)
 }
 
 func (n *node) unregisterEvent(name gen.Atom, pid gen.PID) error {
@@ -1877,20 +2431,8 @@ func (n *node) unregisterEvent(name gen.Atom, pid gen.PID) error {
 	}
 
 	n.log.Trace("...unregisterEvent %s for %s", name, pid)
-	ev := gen.Event{Name: name, Node: n.name}
-	value, exist := n.events.Load(ev)
-	if exist == false {
-		return gen.ErrEventUnknown
-	}
 
-	event := value.(*eventOwner)
-	if event.producer != pid {
-		return gen.ErrEventOwner
-	}
-
-	n.events.Delete(ev)
-	n.RouteTerminateEvent(ev, gen.ErrUnregistered)
-	return nil
+	return n.targets.UnregisterEvent(pid, name)
 }
 
 func (n *node) validateLicenses(versions ...gen.Version) {
